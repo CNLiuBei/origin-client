@@ -1,0 +1,177 @@
+name: Origin
+options:
+  bundleIdPrefix: com.cn
+  deploymentTarget:
+    iOS: "26.0"
+    macOS: "26.0"
+  createIntermediateGroups: true
+  developmentLanguage: zh-Hans
+
+configFiles:
+  Debug: Config/Origin.xcconfig
+  Release: Config/Origin.xcconfig
+
+packages:
+  # 本地依赖，由 scripts/bootstrap.sh 拉取（KSPlayer 2.3.4 为最后一个可在真机使用的 GPL 源码版本）
+  KSPlayer:
+    path: Vendor/KSPlayer
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    SWIFT_APPROACHABLE_CONCURRENCY: YES
+    SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+
+targets:
+  OriginUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: OriginUITests
+    dependencies:
+      - target: Origin
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Origin
+        PRODUCT_BUNDLE_IDENTIFIER: com.cn.OriginUITests
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+
+  Origin:
+    type: application
+    platform: iOS
+    scheme:
+      testTargets:
+        - OriginUITests
+    sources:
+      - path: Origin
+    dependencies:
+      - package: KSPlayer
+        product: KSPlayer
+    info:
+      path: Origin/Info.plist
+      properties:
+        CFBundleDisplayName: Origin
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIBackgroundModes:
+          - audio
+          - fetch
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: Origin 需要访问本地网络，以发现并连接局域网中的飞牛影视、Emby、Jellyfin 或 Plex 媒体服务器。
+        NSBonjourServices:
+          - _trim_media._tcp
+          - _plexmediasvr._tcp
+        LSApplicationQueriesSchemes:
+          - youtube
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        ITSAppUsesNonExemptEncryption: false
+        TMDBReadToken: $(TMDB_READ_TOKEN)
+        NSFaceIDUsageDescription: Origin 会在你打开已加密的服务器前，用面容 ID 确认是你本人。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cn.Origin
+        PRODUCT_NAME: Origin
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: MT4WTGZ4DM
+        OTHER_LDFLAGS: $(inherited) -ObjC
+
+  OriginMacUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: OriginMacUITests
+    dependencies:
+      - target: OriginMac
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: OriginMac
+        PRODUCT_BUNDLE_IDENTIFIER: com.cn.OriginMacUITests
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+
+  OriginMac:
+    type: application
+    platform: macOS
+    scheme:
+      testTargets:
+        - OriginMacUITests
+    sources:
+      - path: Origin
+        excludes:
+          - Info.plist
+          # iOS 专属：应用入口、标签栏根视图、触摸手势
+          - App/OriginApp.swift
+          - App/RootView.swift
+          - Features/Player/PlayerGestureView.swift
+      - path: OriginMac
+        excludes:
+          - Info.plist
+          - OriginMac.entitlements
+    dependencies:
+      - package: KSPlayer
+        product: KSPlayer
+    entitlements:
+      path: OriginMac/OriginMac.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.cn.Origin
+    info:
+      path: OriginMac/Info.plist
+      properties:
+        CFBundleDisplayName: Origin
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.entertainment
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: Origin 需要访问本地网络，以发现并连接局域网中的飞牛影视、Emby、Jellyfin 或 Plex 媒体服务器。
+        NSBonjourServices:
+          - _trim_media._tcp
+          - _plexmediasvr._tcp
+        ITSAppUsesNonExemptEncryption: false
+        TMDBReadToken: $(TMDB_READ_TOKEN)
+        NSFaceIDUsageDescription: Origin 会在你打开已加密的服务器前，用触控 ID 确认是你本人。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cn.Origin
+        PRODUCT_NAME: Origin
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        DEVELOPMENT_TEAM: MT4WTGZ4DM
+        ENABLE_HARDENED_RUNTIME: YES
+        OTHER_LDFLAGS: $(inherited) -ObjC

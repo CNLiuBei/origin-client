@@ -1,0 +1,4 @@
+// 公共构建配置。敏感信息放在同目录的 Secrets.xcconfig（已被 git 忽略）。
+TMDB_READ_TOKEN =
+
+#include? "Secrets.xcconfig"

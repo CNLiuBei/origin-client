@@ -1,0 +1,39 @@
+#!/bin/zsh
+# Origin（macOS Debug 构建）调试控制接口的命令行封装。
+#   originctl state                       → GET /state
+#   originctl ui window=main filter=播放   → GET /ui?window=main&filter=播放
+#   originctl press label=Movies          → POST /press {"label":"Movies"}
+#   originctl shot main /tmp/main.png     → 保存窗口截图
+# 第一个参数是接口名；其余 key=value 参数：GET 接口拼进查询串，其他接口转成 JSON 请求体。
+set -e
+base="http://127.0.0.1:${ORIGIN_CONTROL_PORT:-8765}"
+cmd=${1:-help}
+shift || true
+
+if [[ $cmd == shot ]]; then
+    # 用系统截屏按窗口编号截图（含视频与毛玻璃）；没有屏幕录制权限时退回到应用内渲染
+    name=${1:-main}
+    out=${2:-/tmp/origin-$name.png}
+    number=$(curl -sf "$base/state" | python3 -c "import json,sys; print(next((w['number'] for w in json.load(sys.stdin)['windows'] if w['name']=='$name'), ''))")
+    if [[ -n $number ]] && screencapture -x -o -l "$number" "$out" 2>/dev/null; then
+        echo "$out"
+    else
+        curl -sf "$base/screenshot?window=$name" -o "$out" && echo "$out（应用内渲染）"
+    fi
+    exit
+fi
+
+case $cmd in
+    help|state|libraries|items|item|ui|wait|screenshot|menus|input) method=GET ;;
+    *) method=POST ;;
+esac
+
+if [[ $method == GET ]]; then
+    args=()
+    for pair in "$@"; do args+=(--data-urlencode "$pair"); done
+    curl -sS -G "$base/$cmd" "${args[@]}"
+else
+    json=$(python3 -c 'import json,sys; print(json.dumps(dict(a.split("=",1) for a in sys.argv[1:]), ensure_ascii=False))' "$@")
+    curl -sS -X POST "$base/$cmd" -H 'Content-Type: application/json' --data-binary "$json"
+fi
+echo
