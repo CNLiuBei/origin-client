@@ -1,5 +1,77 @@
 import SwiftUI
 
+/// 与服务配置相同的地址栏：主机、路径、端口、https。
+struct ServerAddressFields: View {
+    @Binding var host: String
+    @Binding var path: String
+    @Binding var port: String
+    @Binding var useHTTPS: Bool
+    var onEdit: () -> Void = {}
+    var onSubmitHost: () -> Void = {}
+    /// 进入页面后把焦点放在主机栏，方便直接粘贴地址
+    var focusOnAppear = false
+
+    @FocusState private var hostFocused: Bool
+
+    var body: some View {
+        TextField("主机", text: $host, prompt: Text("必填"))
+            .accessibilityIdentifier("server-host")
+            .urlKeyboard()
+            .textContentType(.URL)
+            .plainTextEntry()
+            .focused($hostFocused)
+            .onSubmit {
+                absorbPastedAddress()
+                onSubmitHost()
+            }
+            .onChange(of: host) { onEdit() }
+            .onChange(of: hostFocused) { _, focused in
+                if !focused { absorbPastedAddress() }
+            }
+            .task {
+                guard focusOnAppear else { return }
+                try? await Task.sleep(for: .milliseconds(450))
+                hostFocused = true
+            }
+        TextField("路径", text: $path, prompt: Text("可选"))
+            .accessibilityIdentifier("server-path")
+            .plainTextEntry()
+            .onChange(of: path) { onEdit() }
+        TextField("端口", text: $port, prompt: Text("可选"))
+            .accessibilityIdentifier("server-port")
+            .plainTextEntry()
+            #if os(iOS)
+            .keyboardType(.numbersAndPunctuation)
+            #endif
+            .onChange(of: port) { onEdit() }
+        Toggle("https", isOn: $useHTTPS)
+            .onChange(of: useHTTPS) { onEdit() }
+    }
+
+    private func absorbPastedAddress() {
+        ServerAddress.absorb(host: &host, path: &path, port: &port, https: &useHTTPS)
+        onEdit()
+    }
+}
+
+/// 与服务配置相同的超时和证书开关。
+struct ServerAdvancedSettings: View {
+    @Binding var timeout: Double
+    @Binding var allowsInsecureTLS: Bool
+
+    var body: some View {
+        Form {
+            Stepper(value: $timeout, in: 5 ... 120, step: 5) {
+                LabeledContent("超时", value: "\(Int(timeout)) 秒")
+            }
+            Toggle("允许自签名证书", isOn: $allowsInsecureTLS)
+        }
+        .formStyle(.grouped)
+        .navigationTitle("高级设置")
+        .inlineNavigationTitle()
+    }
+}
+
 struct BackupLinesEditor: View {
     @Binding var lines: [ServerLine]
     @State private var draft: LineDraft?
@@ -86,15 +158,8 @@ private struct LineEditor: View {
             Form {
                 TextField("名称", text: $draft.name, prompt: Text("可选"))
                     .plainTextEntry()
-                Section("地址") {
-                    TextField("主机", text: $draft.host, prompt: Text("必填"))
-                        .urlKeyboard()
-                        .plainTextEntry()
-                    TextField("路径", text: $draft.path, prompt: Text("可选"))
-                        .plainTextEntry()
-                    TextField("端口", text: $draft.port, prompt: Text("可选"))
-                        .plainTextEntry()
-                    Toggle("https", isOn: $draft.https)
+                Section("服务器地址") {
+                    ServerAddressFields(host: $draft.host, path: $draft.path, port: $draft.port, useHTTPS: $draft.https)
                 }
             }
             .formStyle(.grouped)
@@ -116,9 +181,11 @@ private struct LineEditor: View {
     }
 
     private func save() {
-        guard let url = ServerAddress.compose(host: draft.host, path: draft.path, port: draft.port, https: draft.https) else { return }
-        let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        onSave(ServerLine(id: draft.id, name: name.isEmpty ? "备用线路" : name, url: url))
+        var editing = draft
+        ServerAddress.absorb(host: &editing.host, path: &editing.path, port: &editing.port, https: &editing.https)
+        guard let url = ServerAddress.compose(host: editing.host, path: editing.path, port: editing.port, https: editing.https) else { return }
+        let name = editing.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        onSave(ServerLine(id: editing.id, name: name.isEmpty ? "备用线路" : name, url: url))
         dismiss()
     }
 }
@@ -130,11 +197,6 @@ struct ServerSyncView: View {
         @Bindable var sync = app.cloudSync
         Form {
             Toggle("同步服务器和播放设置", isOn: $sync.enabled)
-                .disabled(!sync.isAvailable)
-            if !sync.isAvailable {
-                Text("当前签名的开发团队不能启用 iCloud。换成付费开发者账号并打开 iCloud 键值存储后，这里会在各设备之间同步。")
-                    .foregroundStyle(.secondary)
-            }
             if sync.enabled {
                 Section("已同步的设备") {
                     if sync.devices.isEmpty {
@@ -147,6 +209,10 @@ struct ServerSyncView: View {
                 }
                 Section {
                     LabeledContent("状态", value: sync.statusTitle)
+                    LabeledContent("方式", value: sync.transportTitle)
+                    if let lastSynced = sync.lastSynced {
+                        LabeledContent("上次同步", value: lastSynced.formatted(date: .abbreviated, time: .shortened))
+                    }
                     Button("立即同步") { sync.refreshNow() }
                 } footer: {
                     Text(sync.footer)

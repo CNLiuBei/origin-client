@@ -11,8 +11,11 @@ struct PlayerWindowView: View {
             Color.black.ignoresSafeArea()
             switch app.player.active {
             case let .native(controller):
-                NativePlayerSurface(playerView: controller.playerView)
-                    .id(ObjectIdentifier(controller))
+                ZStack {
+                    NativePlayerSurface(playerView: controller.playerView)
+                        .id(ObjectIdentifier(controller))
+                    NativePlayerScreen(model: controller)
+                }
             case let .ffmpeg(model):
                 FFmpegPlayerView(model: model)
                     .id(ObjectIdentifier(model))
@@ -29,21 +32,64 @@ struct PlayerWindowView: View {
                     .font(.headline)
                     .lineLimit(1)
             }
+            .sharedBackgroundVisibility(.hidden)
             if case let .ffmpeg(model) = app.player.active {
                 ToolbarItem(placement: .primaryAction) {
                     PlayerStatusLabel(model: model)
                 }
+                .sharedBackgroundVisibility(.hidden)
             }
         }
-        .toolbarBackgroundVisibility(isFFmpeg ? .hidden : .automatic, for: .windowToolbar)
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
         .windowToolbarFullScreenVisibility(.onHover)
+        .onChange(of: isPictureInPicture) { _, active in
+            guard app.player.active != nil else { return }
+            PlayerWindowChrome.setVisible(!active)
+        }
         .onDisappear { app.player.playerWindowClosed() }
     }
 }
 
 extension PlayerWindowView {
-    private var isFFmpeg: Bool {
-        if case .ffmpeg = app.player.active { true } else { false }
+    private var isPictureInPicture: Bool {
+        switch app.player.active {
+        case let .native(controller): controller.isPictureInPicture
+        case let .ffmpeg(model): model.isPictureInPicture
+        case nil: false
+        }
+    }
+}
+
+/// 画中画已经把画面接走。播放窗口只剩系统占位，先从屏幕上拿掉，播放器本身还在。
+enum PlayerWindowChrome {
+    static var playerWindow: NSWindow? {
+        NSApp.windows.first { $0.identifier?.rawValue.hasPrefix(PlayerWindowView.id) == true }
+    }
+
+    /// 全屏操作落在播放窗口上。按钮点击时它就是当前窗口。
+    static var window: NSWindow? {
+        playerWindow ?? NSApp.keyWindow
+    }
+
+    static var isFullScreen: Bool {
+        window?.styleMask.contains(.fullScreen) == true
+    }
+
+    static func toggleFullScreen() {
+        guard let window else { return }
+        window.collectionBehavior.insert(.fullScreenPrimary)
+        window.styleMask.insert(.resizable)
+        // 在按钮的这次点击里直接切换，系统会把请求丢掉
+        window.perform(#selector(NSWindow.toggleFullScreen(_:)), with: nil, afterDelay: 0)
+    }
+
+    static func setVisible(_ visible: Bool) {
+        guard let playerWindow else { return }
+        if visible {
+            playerWindow.makeKeyAndOrderFront(nil)
+        } else if playerWindow.isVisible {
+            playerWindow.orderOut(nil)
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum SidebarItem: Hashable {
-    case home, search, downloads, favorites
+    case home, search, servers, favorites
     case library(MediaLibrary)
 }
 
@@ -90,7 +90,7 @@ private struct MacSidebarSplitView: View {
                     Label("首页", systemImage: "play.house").tag(SidebarItem.home)
                     Label("搜索", systemImage: "magnifyingglass").tag(SidebarItem.search)
                     Label("收藏", systemImage: "heart").tag(SidebarItem.favorites)
-                    Label("下载", systemImage: "arrow.down.circle").tag(SidebarItem.downloads)
+                    Label("服务器", systemImage: "server.rack").tag(SidebarItem.servers)
                 }
                 if !navigation.libraries.isEmpty {
                     Section("媒体库") {
@@ -112,9 +112,9 @@ private struct MacSidebarSplitView: View {
             .onChange(of: navigation.path.count) { navigation.syncTrail() }
         }
         .task(id: app.contentRevision) {
-            let libraries = await app.collectLibraries()
-            if !libraries.isEmpty || app.homeAccounts.isEmpty {
-                navigation.libraries = libraries
+            let result = await app.collectLibraries()
+            if !result.libraries.isEmpty || app.homeAccounts.isEmpty {
+                navigation.libraries = result.libraries
             }
         }
         .onChange(of: app.activeAccountID) { previous, current in
@@ -131,7 +131,7 @@ private struct MacSidebarSplitView: View {
         switch navigation.selection ?? .home {
         case .home: HomeView()
         case .search: SearchView()
-        case .downloads: DownloadsView()
+        case .servers: ServersView()
         case .favorites: ItemsGridView(source: .favorites)
         case let .library(library): ItemsGridView(source: .library(library))
         }

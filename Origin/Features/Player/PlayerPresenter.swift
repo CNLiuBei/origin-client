@@ -25,6 +25,8 @@ final class PlayerPresenter {
 
     private(set) var isPreparing = false
     var errorMessage: String?
+    @ObservationIgnored private var playGeneration = 0
+    @ObservationIgnored private var lastRequest: (MediaItem, Bool?, String?)?
 
     init(app: AppModel) {
         self.app = app
@@ -33,16 +35,34 @@ final class PlayerPresenter {
     /// - Parameter resume: nil 表示按设置决定是否续播
     func play(_ item: MediaItem, resume: Bool? = nil, sourceID: String? = nil) {
         guard !isPreparing else { return }
+        lastRequest = (item, resume, sourceID)
+        playGeneration += 1
+        let generation = playGeneration
         isPreparing = true
         Task {
-            defer { isPreparing = false }
+            let session: PlaybackSession
             do {
-                let session = try await makeSession(for: item, resume: resume, sourceID: sourceID)
-                present(session)
+                session = try await makeSession(for: item, resume: resume, sourceID: sourceID)
             } catch {
+                guard playGeneration == generation else { return }
+                isPreparing = false
                 errorMessage = error.localizedDescription
+                return
             }
+            guard playGeneration == generation else { return }
+            isPreparing = false
+            present(session)
         }
+    }
+
+    func cancelPrepare() {
+        playGeneration += 1
+        isPreparing = false
+    }
+
+    func retryLast() {
+        guard let lastRequest else { return }
+        play(lastRequest.0, resume: lastRequest.1, sourceID: lastRequest.2)
     }
 
     func makeSession(for item: MediaItem, resume: Bool?, sourceID: String? = nil) async throws -> PlaybackSession {
@@ -56,9 +76,14 @@ final class PlayerPresenter {
             let native = source.map(PlaybackCompatibility.canPlayNatively) ?? false
             let engine: PlaybackEngineKind = settings.engine == .ffmpeg || !native ? .ffmpeg : .native
             let start = startTime(for: saved, resume: resume)
-            return PlaybackSession(item: saved, source: source, url: localURL, headers: [:], engine: engine,
-                                   externalSubtitles: [], startTime: start, isTranscoding: false, isOffline: true,
-                                   playSessionID: playSessionID, client: client)
+            let session = PlaybackSession(item: saved, source: source, url: localURL, headers: [:], engine: engine,
+                                          externalSubtitles: [], startTime: start, isTranscoding: false, isOffline: true,
+                                          playSessionID: playSessionID, client: client)
+            let itemID = saved.id
+            session.onLocalProgress = { [weak app] position, duration in
+                app?.downloads.notePlayback(id: itemID, position: position, duration: duration)
+            }
+            return session
         }
 
         guard let client else { throw APIError.message("找不到该内容所属的服务器") }
@@ -145,7 +170,10 @@ final class PlayerPresenter {
             active = .native(controller)
         case .ffmpeg:
             let model = FFmpegPlayerModel(session: session, presenter: self, settings: app.settings)
-            model.dismissAction = { [weak self] in self?.dismissPlayerWindow() }
+            model.dismissAction = { [weak self] done in
+                self?.dismissPlayerWindow()
+                done()
+            }
             active = .ffmpeg(model)
         }
         windowActions?.open()
@@ -210,8 +238,103 @@ enum OrientationPolicy {
         guard UIDevice.current.userInterfaceIdiom == .phone else { return }
         for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
             scene.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+            guard scene.interfaceOrientation.isLandscape else { continue }
             scene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait))
         }
+    }
+}
+
+/// 关闭播放器：iPhone 上淡出和转回竖屏是同一次动画，iPad 上只淡出。
+/// 默认的滑出和中途改方向会叠在一起，画面会顿一下。
+@MainActor
+final class PlayerCloseTransition {
+    private var isClosing = false
+    private var didStart = false
+    private var didFinish = false
+    private var completion: (() -> Void)?
+    private var fallback: DispatchWorkItem?
+
+    func start(on controller: UIViewController, completion: (() -> Void)? = nil) {
+        guard !isClosing else { return }
+        isClosing = true
+        self.completion = completion
+        controller.view.isUserInteractionEnabled = false
+
+        guard !UIAccessibility.isReduceMotionEnabled else {
+            controller.dismiss(animated: false) { [weak self] in
+                OrientationPolicy.restorePortrait()
+                self?.complete()
+            }
+            return
+        }
+
+        let phone = controller.traitCollection.userInterfaceIdiom == .phone
+        if phone {
+            controller.setNeedsUpdateOfSupportedInterfaceOrientations()
+            let work = DispatchWorkItem { [weak self, weak controller] in
+                guard let self, let controller else { return }
+                self.fadeAndFinish(controller)
+            }
+            fallback = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
+            controller.view.window?.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait)) { [weak self, weak controller] _ in
+                Task { @MainActor in
+                    guard let self, let controller else { return }
+                    self.fadeAndFinish(controller)
+                }
+            }
+        } else {
+            fadeAndFinish(controller)
+        }
+    }
+
+    /// 关闭过程中手机只允许竖屏，转场才能和淡出一起进行
+    func orientations(for controller: UIViewController) -> UIInterfaceOrientationMask? {
+        guard isClosing, controller.traitCollection.userInterfaceIdiom == .phone else { return nil }
+        return .portrait
+    }
+
+    func viewWillTransition(on controller: UIViewController, coordinator: UIViewControllerTransitionCoordinator) {
+        guard isClosing, !didStart else { return }
+        didStart = true
+        fallback?.cancel()
+        coordinator.animate(alongsideTransition: { _ in
+            controller.view.alpha = 0
+        }, completion: { [weak self, weak controller] _ in
+            guard let controller else { return }
+            self?.finish(controller)
+        })
+    }
+
+    private func fadeAndFinish(_ controller: UIViewController) {
+        guard !didStart else { return }
+        didStart = true
+        fallback?.cancel()
+        UIView.animate(withDuration: 0.32, delay: 0, options: [.curveEaseInOut, .beginFromCurrentState]) {
+            controller.view.alpha = 0
+        } completion: { [weak self, weak controller] _ in
+            guard let controller else { return }
+            self?.finish(controller)
+        }
+    }
+
+    private func finish(_ controller: UIViewController) {
+        guard !didFinish else { return }
+        didFinish = true
+        fallback?.cancel()
+        guard controller.presentingViewController != nil else {
+            complete()
+            return
+        }
+        controller.dismiss(animated: false) { [weak self] in
+            self?.complete()
+        }
+    }
+
+    private func complete() {
+        let done = completion
+        completion = nil
+        done?()
     }
 }
 #endif

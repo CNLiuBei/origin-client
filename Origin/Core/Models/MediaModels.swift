@@ -17,6 +17,15 @@ enum ServerKind: String, Codable, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// 未填写端口时使用的默认端口。
+    var defaultPort: Int {
+        switch self {
+        case .jellyfin, .emby: 8096
+        case .plex: 32400
+        case .fnos: 8005
+        }
+    }
+
     /// 各服务官方应用图标，资源名与 Assets 中的 imageset 一致。
     var iconAsset: String {
         switch self {

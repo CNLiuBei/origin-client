@@ -43,14 +43,14 @@ final class AddServerPageTests: XCTestCase {
         sleep(1)
         snapshot("01-sources")
 
-        // 手动添加：不写端口时自动补全
-        app.buttons["manual-account"].tap()
-        let address = app.textFields["server-address"]
+        // 手动添加：飞牛默认端口 8005，地址栏与服务配置一致
+        app.buttons["manual-fnos"].tap()
+        let address = app.textFields["server-host"]
         XCTAssertTrue(address.waitForExistence(timeout: 5))
-        sleep(1)
+        let port = app.textFields["server-port"]
+        XCTAssertEqual(port.value as? String, "8005")
+        address.tap()
         address.typeText(host)
-        let found = app.staticTexts.matching(NSPredicate(format: "label CONTAINS ':8005'")).firstMatch
-        XCTAssertTrue(found.waitForExistence(timeout: 15), "没有自动识别出 8005 端口")
         snapshot("02-manual-port-detected")
         app.navigationBars.buttons.element(boundBy: 0).tap()
 

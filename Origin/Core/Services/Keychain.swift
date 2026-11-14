@@ -46,6 +46,23 @@ enum Keychain {
         read(itemQuery(key, synchronizable: true)).0
     }
 
+    static func data(for key: String) -> Data? {
+        readData(itemQuery(key, synchronizable: false))
+    }
+
+    static func synchronizableData(for key: String) -> Data? {
+        readData(itemQuery(key, synchronizable: true))
+    }
+
+    @discardableResult
+    static func setData(_ value: Data?, for key: String, synchronizable: Bool) -> Bool {
+        let localOK = writeData(value, for: key, synchronizable: false) == errSecSuccess
+        if synchronizable {
+            _ = writeData(value, for: key, synchronizable: true)
+        }
+        return localOK
+    }
+
     private static func read(_ base: [String: Any]) -> (String?, OSStatus) {
         var query = base
         query[kSecReturnData as String] = true
@@ -87,17 +104,30 @@ enum Keychain {
         return query
     }
 
+    private static func readData(_ base: [String: Any]) -> Data? {
+        var query = base
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess else { return nil }
+        return result as? Data
+    }
+
     private static func write(_ value: String?, for key: String, synchronizable: Bool) -> OSStatus {
+        writeData(value.map { Data($0.utf8) }, for: key, synchronizable: synchronizable)
+    }
+
+    private static func writeData(_ value: Data?, for key: String, synchronizable: Bool) -> OSStatus {
         let query = itemQuery(key, synchronizable: synchronizable)
         guard let value else {
             return SecItemDelete(query as CFDictionary)
         }
-        let data = Data(value.utf8)
-        let update: [String: Any] = [kSecValueData as String: data]
+        let update: [String: Any] = [kSecValueData as String: value]
         let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
         guard status == errSecItemNotFound else { return status }
         var add = query
-        add[kSecValueData as String] = data
+        add[kSecValueData as String] = value
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         return SecItemAdd(add as CFDictionary, nil)
     }

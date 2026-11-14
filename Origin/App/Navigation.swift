@@ -5,6 +5,7 @@ enum Route: Hashable {
     case children(MediaItem)
     case favorites
     case servers
+    case downloads
 }
 
 extension View {
@@ -23,6 +24,7 @@ extension View {
             case let .children(item): ItemsGridView(source: .children(item))
             case .favorites: ItemsGridView(source: .favorites)
             case .servers: ServersView()
+            case .downloads: DownloadsView()
             }
         }
     }

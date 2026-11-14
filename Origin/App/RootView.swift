@@ -5,7 +5,7 @@ struct RootView: View {
     @State private var tab = AppTab.home
 
     enum AppTab: Hashable {
-        case home, libraries, downloads, settings, search
+        case home, libraries, servers, settings, search
     }
 
     var body: some View {
@@ -21,8 +21,8 @@ struct RootView: View {
                     Tab("媒体库", systemImage: "square.stack", value: .libraries) {
                         NavigationStack { LibrariesView().mediaDestinations() }
                     }
-                    Tab("下载", systemImage: "arrow.down.circle", value: .downloads) {
-                        NavigationStack { DownloadsView().mediaDestinations() }
+                    Tab("服务器", systemImage: "server.rack", value: .servers) {
+                        NavigationStack { ServersView().mediaDestinations() }
                     }
                     Tab("设置", systemImage: "gearshape", value: .settings) {
                         NavigationStack { SettingsView().mediaDestinations() }
@@ -45,12 +45,17 @@ struct RootView: View {
         .onAppear { HorizontalScrollbarSuppression.start() }
         .overlay {
             if app.player.isPreparing {
-                ProgressView("正在准备播放…")
-                    .padding(24)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 20))
+                VStack(spacing: 12) {
+                    ProgressView("正在准备播放…")
+                    Button("取消") { app.player.cancelPrepare() }
+                        .buttonStyle(.glass)
+                }
+                .padding(24)
+                .glassEffect(.regular, in: .rect(cornerRadius: 20))
             }
         }
         .alert("播放出错", isPresented: Binding(get: { player.errorMessage != nil }, set: { if !$0 { player.errorMessage = nil } })) {
+            Button("重试") { player.retryLast() }
             Button("好", role: .cancel) {}
         } message: {
             Text(player.errorMessage ?? "")

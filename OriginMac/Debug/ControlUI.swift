@@ -102,7 +102,7 @@ enum MouseInput {
             guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
                                                  windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
                                                  pressure: type == .leftMouseDown ? 1 : 0) else { return false }
-            NSApp.postEvent(event, atStart: false)
+            window.sendEvent(event)
         }
         return true
     }

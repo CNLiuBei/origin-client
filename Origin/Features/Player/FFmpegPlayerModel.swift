@@ -1,4 +1,6 @@
 import AVFoundation
+import AVKit
+import Combine
 @preconcurrency import KSPlayer
 import MediaPlayer
 import SwiftUI
@@ -30,7 +32,8 @@ final class FFmpegPlayerModel {
     let settings: AppSettings
     @ObservationIgnored let coordinator = KSVideoPlayer.Coordinator()
     @ObservationIgnored private weak var presenter: PlayerPresenter?
-    @ObservationIgnored var dismissAction: (() -> Void)?
+    /// 参数在播放界面真正消失后调用，用来接上进度刷新或下一个播放器
+    @ObservationIgnored var dismissAction: ((@escaping () -> Void) -> Void)?
 
     private(set) var url: URL
     private(set) var options: OriginPlayerOptions
@@ -39,6 +42,8 @@ final class FFmpegPlayerModel {
     private(set) var duration: TimeInterval = 0
     private(set) var audioTracks: [MediaPlayerTrack] = []
     private(set) var selectedAudioID: Int32?
+    private(set) var subtitleChoices: [PlayerChoice] = []
+    private(set) var subtitleSelection = ""
     private(set) var chapters: [Chapter] = []
     var controlsVisible = true {
         didSet {
@@ -64,7 +69,11 @@ final class FFmpegPlayerModel {
     private(set) var playableTime: TimeInterval = 0
     /// 网络读取速度（字节/秒）
     private(set) var bytesPerSecond: Int64 = 0
+    /// 系统画中画已经接走画面。为 true 时播放窗口不再留在屏幕上。
+    private(set) var isPictureInPicture = false
     @ObservationIgnored private var lastBytesSample: (date: Date, bytes: Int64)?
+    @ObservationIgnored private var pipCancellable: AnyCancellable?
+    @ObservationIgnored private var pipHideTask: Task<Void, Never>?
     #endif
 
     @ObservationIgnored private var hideTask: Task<Void, Never>?
@@ -140,6 +149,7 @@ final class FFmpegPlayerModel {
         #if os(macOS)
         // KSPlayer 在此回调之后会按自身状态改写 isMaskShow（并显隐窗口标题栏），下一轮再以本模型为准
         Task { @MainActor in self.syncWindowChrome() }
+        observePictureInPicture(layer)
         #endif
         switch newState {
         case .readyToPlay:
@@ -173,8 +183,14 @@ final class FFmpegPlayerModel {
         currentTime = current
         duration = total
         session.update(position: current, duration: total, paused: !state.isPlaying)
+        if let skipped = session.considerSegments(at: current, intro: settings.skipIntro, credits: settings.skipCredits, seek: { [weak self] time in
+            self?.seek(to: time)
+        }) {
+            flash(.message(skipped.kind.doneTitle))
+        }
         syncLiveRate()
         syncRemoteNavigation()
+        syncSubtitleChoices()
         #if os(macOS)
         sampleNetwork()
         #endif
@@ -202,6 +218,7 @@ final class FFmpegPlayerModel {
     }
 
     private func addSubtitles() {
+        defer { syncSubtitleChoices() }
         let model = coordinator.subtitleModel
         for subtitle in session.externalSubtitles {
             model.addSubtitle(info: URLSubtitleInfo(subtitleID: subtitle.id, name: subtitle.name, url: subtitle.url, userAgent: options.userAgent))
@@ -304,6 +321,14 @@ final class FFmpegPlayerModel {
         center.previousTrackCommand.isEnabled = hasPrevious
     }
 
+    private func syncSubtitleChoices() {
+        let infos = coordinator.subtitleModel.subtitleInfos
+        let choices = infos.map { PlayerChoice(id: $0.subtitleID, title: $0.name.ifEmpty("字幕")) }
+        let selected = coordinator.subtitleModel.selectedSubtitleInfo?.subtitleID ?? ""
+        if choices != subtitleChoices { subtitleChoices = choices }
+        if selected != subtitleSelection { subtitleSelection = selected }
+    }
+
     private func syncLiveRate() {
         #if os(iOS)
         if rateBeforeLongPress != nil { return }
@@ -355,10 +380,16 @@ final class FFmpegPlayerModel {
         flash(.message(isFill ? "填充屏幕" : "适应屏幕"))
     }
 
-    func selectAudio(_ id: Int32) {
-        guard let track = audioTracks.first(where: { $0.trackID == id }) else { return }
+    func selectAudio(_ id: String) {
+        guard let trackID = Int32(id), let track = audioTracks.first(where: { $0.trackID == trackID }) else { return }
         playerLayer?.player.select(track: track)
-        selectedAudioID = id
+        selectedAudioID = trackID
+    }
+
+    func selectSubtitle(_ id: String) {
+        let subtitles = coordinator.subtitleModel
+        subtitles.selectedSubtitleInfo = id.isEmpty ? nil : subtitles.subtitleInfos.first { $0.subtitleID == id }
+        subtitleSelection = id
     }
 
     func setSubtitleDelay(_ value: Double) {
@@ -374,6 +405,20 @@ final class FFmpegPlayerModel {
     func toggleLock() {
         isLocked.toggle()
         showControls()
+    }
+
+    func retry() {
+        guard let layer = playerLayer else { return }
+        errorText = nil
+        options.startPlayTime = currentTime
+        layer.player.replace(url: url, options: options)
+        layer.prepareToPlay()
+    }
+
+    func skipCurrentSegment() {
+        if let segment = session.skipPromptedSegment(seek: { [weak self] time in self?.seek(to: time) }) {
+            flash(.message(segment.kind.doneTitle))
+        }
     }
 
     func playNext() {
@@ -430,13 +475,29 @@ final class FFmpegPlayerModel {
     }
 
     func close(completion: (() -> Void)? = nil) {
-        guard !closed else { return }
+        guard !closed else {
+            completion?()
+            return
+        }
         closed = true
         playbackGeneration += 1
         session.update(position: currentTime, duration: duration, paused: true, force: true)
         session.stop()
         playerLayer?.pause()
         if playerLayer?.isPipActive == true { playerLayer?.isPipActive = false }
+        let finish = { [weak self] in
+            self?.releasePlayback()
+            completion?()
+        }
+        if let dismissAction {
+            dismissAction(finish)
+        } else {
+            finish()
+        }
+    }
+
+    /// 界面转场结束后再释放会话和刷新资料库，避免和关闭动画抢主线程
+    private func releasePlayback() {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         let center = MPRemoteCommandCenter.shared()
         if let nextCommandTarget { center.nextTrackCommand.removeTarget(nextCommandTarget) }
@@ -445,15 +506,6 @@ final class FFmpegPlayerModel {
         previousCommandTarget = nil
         PlaybackAudioSession.deactivate()
         presenter?.playbackEnded()
-        if let dismissAction {
-            dismissAction()
-            if let completion {
-                Task {
-                    try? await Task.sleep(for: .milliseconds(450))
-                    completion()
-                }
-            }
-        }
     }
 
     // MARK: - 控制栏显隐与提示
@@ -509,6 +561,37 @@ final class FFmpegPlayerModel {
         if coordinator.isMaskShow != controlsVisible { coordinator.isMaskShow = controlsVisible }
     }
 
+    /// 等系统画中画真正开始再标记，避免窗口先消失、画中画还没出现。
+    private func observePictureInPicture(_ layer: KSPlayerLayer) {
+        guard pipCancellable == nil else { return }
+        pipCancellable = layer.$isPipActive
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] active in
+                Task { @MainActor in
+                    self?.updatePictureInPicture(active)
+                }
+            }
+    }
+
+    private func updatePictureInPicture(_ active: Bool) {
+        pipHideTask?.cancel()
+        guard !closed else { return }
+        guard active else {
+            isPictureInPicture = false
+            return
+        }
+        pipHideTask = Task { @MainActor in
+            for _ in 0 ..< 30 {
+                if Task.isCancelled || closed { return }
+                if playerLayer?.player.pipController?.isPictureInPictureActive == true {
+                    isPictureInPicture = true
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+    }
+
     private func sampleNetwork() {
         guard let player = playerLayer?.player else { return }
         playableTime = player.playableTime
@@ -524,6 +607,12 @@ final class FFmpegPlayerModel {
     #endif
 
     #if os(iOS)
+    var volume: Float { 1 }
+
+    func setVolume(_ value: Float) {}
+
+    func adjustVolume(by delta: Float) {}
+
     // MARK: - 手势
 
     func handleDoubleTap(xFraction: CGFloat) {
@@ -595,6 +684,42 @@ final class FFmpegPlayerModel {
         if scale < 0.9, isFill { toggleFill() }
     }
     #endif
+}
+
+extension FFmpegPlayerModel: PlayerSurface {
+    func close() { close(completion: nil) }
+
+    var audioChoices: [PlayerChoice] {
+        audioTracks.map { track in
+            let language = track.languageCode.flatMap { Locale.current.localizedString(forLanguageCode: $0) }
+            let title = [language, track.name.isEmpty ? nil : track.name].compactMap(\.self).joined(separator: " · ").ifEmpty("轨道 \(track.trackID)")
+            return PlayerChoice(id: String(track.trackID), title: title)
+        }
+    }
+
+    var audioSelection: String { selectedAudioID.map(String.init) ?? "" }
+
+    var chapterMarks: [PlayerChapterMark] {
+        chapters.enumerated().map { index, chapter in
+            PlayerChapterMark(id: index, title: chapter.title, start: chapter.start)
+        }
+    }
+
+    var supportsSubtitleDelay: Bool { true }
+
+    var engineName: String { playerLayer?.player is KSMEPlayer ? "FFmpeg" : "AVPlayer" }
+
+    func liveStatRows() -> [(String, String)] {
+        guard let info = playerLayer?.player.dynamicInfo else { return [] }
+        return [
+            ("帧率", info.displayFPS.formatted(.number.precision(.fractionLength(1)))),
+            ("丢帧", "\(info.droppedVideoFrameCount + info.droppedVideoPacketCount)"),
+            ("音画差", String(format: "%.3f 秒", info.audioVideoSyncDiff)),
+            ("视频码率", "\(info.videoBitrate / 1000) kbps"),
+            ("音频码率", "\(info.audioBitrate / 1000) kbps"),
+            ("已读取", ByteCountFormatter.string(fromByteCount: info.bytesRead, countStyle: .file)),
+        ]
+    }
 }
 
 #if os(iOS)

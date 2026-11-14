@@ -154,10 +154,46 @@ enum ServerAddress {
         return components.url
     }
 
+    /// 把粘进「主机」的完整地址拆开。普通主机名原样保留。
+    static func absorb(host: inout String, path: inout String, port: inout String, https: inout Bool) {
+        guard let parsed = parse(pasted: host) else { return }
+        let wasURL = host.contains("://") || host.contains("/")
+        host = parsed.host
+        if !parsed.path.isEmpty { path = parsed.path }
+        if wasURL {
+            port = parsed.port
+            https = parsed.https
+        } else if !parsed.port.isEmpty {
+            port = parsed.port
+        }
+    }
+
     static func parts(of url: URL) -> (host: String, path: String, port: String, https: Bool) {
         let stored = url.path()
         let path = (stored.isEmpty || stored == "/") ? "" : String(stored.drop(while: { $0 == "/" }))
         return (url.host() ?? "", path, url.port.map(String.init) ?? "", url.scheme?.lowercased() == "https")
+    }
+
+    private static func parse(pasted raw: String) -> (host: String, path: String, port: String, https: Bool)? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.contains("://") || trimmed.contains("/") {
+            let candidate = trimmed.contains("://") ? trimmed : "http://\(trimmed)"
+            guard let url = URL(string: candidate), let host = url.host(), !host.isEmpty else { return nil }
+            return parts(of: url)
+        }
+        if trimmed.hasPrefix("[") {
+            guard let end = trimmed.firstIndex(of: "]") else { return nil }
+            let host = String(trimmed[trimmed.startIndex...end])
+            let rest = trimmed[trimmed.index(after: end)...]
+            guard rest.hasPrefix(":"), let port = Int(rest.dropFirst()), (1 ... 65535).contains(port) else { return nil }
+            return (host, "", String(port), false)
+        }
+        guard let colon = trimmed.lastIndex(of: ":") else { return nil }
+        let host = String(trimmed[..<colon])
+        let portText = String(trimmed[trimmed.index(after: colon)...])
+        guard !host.isEmpty, !host.contains(":"), let port = Int(portText), (1 ... 65535).contains(port) else { return nil }
+        return (host, "", portText, false)
     }
 
     static func same(_ url: URL, as other: URL) -> Bool {
@@ -171,7 +207,7 @@ enum DeviceInfo {
     static let clientName = "Origin"
 
     static var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.1"
     }
 
     #if os(macOS)

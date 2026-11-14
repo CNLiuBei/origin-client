@@ -25,12 +25,12 @@ final class MacDemoFlowTests: XCTestCase {
         guard addButton.waitForExistence(timeout: 5) else { return }
         snapshot("01-welcome")
         addButton.click()
-        let manual = app.descendants(matching: .any)["manual-account"].firstMatch
+        let manual = app.descendants(matching: .any)["manual-jellyfin"].firstMatch
         XCTAssertTrue(manual.waitForExistence(timeout: 5))
         sleep(1)
         snapshot("02-add-server")
         manual.click()
-        let address = app.textFields["server-address"]
+        let address = app.textFields["server-host"]
         XCTAssertTrue(address.waitForExistence(timeout: 5))
         address.click()
         address.typeText("https://demo.jellyfin.org/stable\r")

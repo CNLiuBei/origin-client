@@ -15,6 +15,7 @@ struct ItemDetailView: View {
     @State private var selectedSourceID: String?
     @State private var overviewExpanded = false
     @State private var errorText: String?
+    @State private var actionError: String?
     @State private var loadedRevision: Int?
     @State private var contentWidth: CGFloat = 390
 
@@ -80,6 +81,25 @@ struct ItemDetailView: View {
         .inlineNavigationTitle()
         .toolbar {
             ToolbarItem(placement: .primaryAction) { moreMenu }
+        }
+        .overlay {
+            if detail == nil, let errorText {
+                ContentUnavailableView {
+                    Label("无法加载详情", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(errorText)
+                } actions: {
+                    Button("重试") { Task { await load() } }
+                        .buttonStyle(.glass)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.background)
+            }
+        }
+        .alert("操作失败", isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(actionError ?? "")
         }
         .task(id: app.contentRevision) {
             // 切换标签或从下一级返回时不重复加载，内容有变化（如播放进度更新）才刷新
@@ -216,12 +236,12 @@ struct ItemDetailView: View {
         HStack(spacing: 36) {
             if client?.supportsFavorites == true {
                 iconButton(current.userState.isFavorite ? "heart.fill" : "heart", label: current.userState.isFavorite ? "取消收藏" : "收藏") {
-                    Task { try? await app.toggleFavorite(current) }
+                    toggleFavorite()
                 }
             }
             iconButton(current.userState.isPlayed ? "checkmark.circle.fill" : "checkmark.circle",
                        label: current.userState.isPlayed ? "标记为未看" : "标记为已看") {
-                Task { try? await app.togglePlayed(current) }
+                togglePlayed()
             }
             if let target = playTarget, target.isResumable {
                 iconButton("arrow.counterclockwise", label: "从头播放") {
@@ -234,6 +254,45 @@ struct ItemDetailView: View {
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    /// 先改本地状态，请求失败再改回去。成功后的整页刷新会用服务器结果覆盖。
+    private func toggleFavorite() {
+        let original = current
+        patchUserState { $0.isFavorite.toggle() }
+        Task {
+            do {
+                try await app.toggleFavorite(original)
+            } catch {
+                detail = original
+                actionError = error.localizedDescription
+            }
+        }
+    }
+
+    private func togglePlayed() {
+        let original = current
+        patchUserState {
+            $0.isPlayed.toggle()
+            if $0.isPlayed {
+                $0.playbackPosition = 0
+                $0.unplayedCount = 0
+            }
+        }
+        Task {
+            do {
+                try await app.togglePlayed(original)
+            } catch {
+                detail = original
+                actionError = error.localizedDescription
+            }
+        }
+    }
+
+    private func patchUserState(_ change: (inout UserState) -> Void) {
+        var item = current
+        change(&item.userState)
+        detail = item
     }
 
     private func iconButton(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
@@ -252,19 +311,28 @@ struct ItemDetailView: View {
     private var downloadButton: some View {
         let record = app.downloads.record(for: current.id)
         Button {
-            if record == nil, !current.mediaSources.isEmpty {
+            if let record {
+                switch record.state {
+                case .completed:
+                    app.player.play(current)
+                case .downloading, .queued:
+                    app.downloads.pause(record)
+                case .paused, .failed:
+                    app.downloads.resume(record)
+                }
+            } else if !current.mediaSources.isEmpty {
                 app.downloads.download(current)
             }
         } label: {
             Group {
                 switch record?.state {
                 case .completed:
-                    Image(systemName: "arrow.down.circle.fill")
+                    Image(systemName: "play.circle.fill")
                 case .downloading, .queued:
                     ProgressView(value: record?.progress ?? 0)
                         .progressViewStyle(.circular)
                 case .paused, .failed:
-                    Image(systemName: "pause.circle")
+                    Image(systemName: "arrow.clockwise.circle")
                 case nil:
                     Image(systemName: "arrow.down.circle")
                 }
@@ -274,7 +342,16 @@ struct ItemDetailView: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("下载")
+        .accessibilityLabel(downloadLabel(record?.state))
+    }
+
+    private func downloadLabel(_ state: DownloadRecord.State?) -> String {
+        switch state {
+        case .completed: "播放已下载"
+        case .downloading, .queued: "暂停下载"
+        case .paused, .failed: "继续下载"
+        case nil: "下载"
+        }
     }
 
     private var moreMenu: some View {
@@ -465,7 +542,11 @@ struct ItemDetailView: View {
                 }
             }
         } catch {
-            errorText = error.localizedDescription
+            if detail == nil {
+                errorText = error.localizedDescription
+            } else {
+                actionError = error.localizedDescription
+            }
         }
         if similar.isEmpty, current.kind == .movie || current.kind == .series {
             similar = (try? await client.similar(to: current, limit: 16)) ?? []

@@ -125,15 +125,18 @@ struct ServersView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                #if os(macOS)
-                Text("服务器")
-                    .font(.title3.weight(.semibold))
-                #endif
                 if app.accounts.isEmpty {
                     ContentUnavailableView("还没有服务器", systemImage: "server.rack", description: Text("添加一台 Jellyfin、Emby、Plex 或飞牛影视"))
                         .frame(maxWidth: .infinity)
                         .padding(.top, 40)
                 } else {
+                    #if os(iOS)
+                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+                        ForEach(app.accounts) { account in
+                            card(account)
+                        }
+                    }
+                    #else
                     LazyVGrid(
                         columns: [GridItem(.adaptive(minimum: 220, maximum: 260), spacing: 16, alignment: .top)],
                         alignment: .leading,
@@ -143,27 +146,27 @@ struct ServersView: View {
                             card(account)
                         }
                     }
+                    #endif
                 }
             }
-            .padding(20)
+            .padding(.horizontal, horizontalPadding)
+            .padding(.vertical, 16)
             .frame(maxWidth: .infinity, alignment: .leading)
             .hideSystemScrollbars()
         }
         .scrollIndicators(.hidden)
         .navigationTitle("服务器")
-        #if os(macOS)
-        .toolbar(removing: .title)
-        #endif
+        .inlineNavigationTitle()
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button("重新检测", systemImage: "arrow.clockwise") {
-                    Task { await refreshStatuses(force: true) }
-                }
-                .disabled(statuses.values.contains(.checking))
+            #if os(iOS)
+            ToolbarItemGroup(placement: .primaryAction) {
+                refreshButton.labelStyle(.iconOnly)
+                addButton.labelStyle(.iconOnly)
             }
-            ToolbarItem(placement: .primaryAction) {
-                Button("添加", systemImage: "plus") { showAdd = true }
-            }
+            #else
+            ToolbarItem(placement: .primaryAction) { refreshButton }
+            ToolbarItem(placement: .primaryAction) { addButton }
+            #endif
         }
         .sheet(isPresented: $showAdd) { AddServerView() }
         .sheet(isPresented: Binding(get: { editing != nil }, set: { if !$0 { editing = nil } }), onDismiss: { focusPassword = false }) {
@@ -186,76 +189,156 @@ struct ServersView: View {
         .refreshable { await refreshStatuses(force: true) }
     }
 
-    /// 左上名称、右上类型图标，底部左右各一行说明
+    private var horizontalPadding: CGFloat {
+        #if os(iOS)
+        16
+        #else
+        20
+        #endif
+    }
+
+    private var refreshButton: some View {
+        Button("重新检测", systemImage: "arrow.clockwise") {
+            Task { await refreshStatuses(force: true) }
+        }
+        .disabled(statuses.values.contains(.checking))
+    }
+
+    private var addButton: some View {
+        Button("添加", systemImage: "plus") { showAdd = true }
+    }
+
+    /// 左上名称、右上类型图标，底部左右各一行说明。iPhone 上一行两张，并用菜单露出操作。
     private func card(_ account: ServerAccount) -> some View {
-        return Button {
-            openEditor(account, password: false)
-        } label: {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .top, spacing: 12) {
-                    Text(account.name)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                    Spacer(minLength: 8)
-                    ZStack(alignment: .bottomTrailing) {
-                        ServerAccountIcon(account: account, size: 44)
-                        if account.isEncrypted {
-                            Image(systemName: "lock.fill")
-                                .font(.caption2)
-                                .foregroundStyle(.white)
-                                .padding(3)
-                                .background(.black.opacity(0.55), in: .circle)
-                                .offset(x: 4, y: 4)
-                        }
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top, spacing: 12) {
+                Text(account.name)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Spacer(minLength: 8)
+                ZStack(alignment: .bottomTrailing) {
+                    ServerAccountIcon(account: account, size: iconSize)
+                    if account.isEncrypted {
+                        Image(systemName: "lock.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.white)
+                            .padding(3)
+                            .background(.black.opacity(0.55), in: .circle)
+                            .offset(x: 4, y: 4)
                     }
                 }
-                Spacer(minLength: 28)
-                HStack(alignment: .firstTextBaseline) {
-                    Text(account.note.isEmpty ? account.activeLineName : account.note)
-                        .lineLimit(1)
-                    Spacer(minLength: 8)
-                    Text(app.isLocked(account) ? "已加密" : statusCaption(statuses[account.id]))
-                        .lineLimit(1)
-                }
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
             }
-            .padding(16)
-            .frame(maxWidth: .infinity, minHeight: 118, alignment: .leading)
-            .background {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(cardFill)
+            Spacer(minLength: cardSpacer)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(account.note.isEmpty ? account.activeLineName : account.note)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Text(app.isLocked(account) ? "已加密" : statusCaption(statuses[account.id]))
+                    .lineLimit(1)
+                #if os(iOS)
+                Color.clear.frame(width: 28, height: 1)
+                #endif
             }
+            .font(bottomFont)
+            .foregroundStyle(.secondary)
         }
-        .buttonStyle(.plain)
+        .padding(cardPadding)
+        .frame(maxWidth: .infinity, minHeight: cardHeight, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(cardFill)
+        }
+        .contentShape(.rect)
+        .onTapGesture { openEditor(account, password: false) }
         .accessibilityLabel("\(account.name)，\(account.activeLineName)，\(app.isLocked(account) ? "已加密" : statusCaption(statuses[account.id]))")
-        .contextMenu {
-            Button("服务配置", systemImage: "slider.horizontal.3") { openEditor(account, password: false) }
-            Button(account.aggregationDisabled ? "启用聚合" : "禁用聚合",
-                   systemImage: account.aggregationDisabled ? "square.stack.3d.up" : "square.stack.3d.up.slash") {
-                var updated = account
-                updated.aggregationDisabled.toggle()
-                app.update(updated)
+        .accessibilityAddTraits(.isButton)
+        .overlay(alignment: .bottomTrailing) {
+            #if os(iOS)
+            Menu {
+                serverActions(for: account)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(.rect)
             }
-            Button("设为默认首页", systemImage: "house") {
-                Task { await app.setDefaultHome(account) }
-            }
-            .disabled(app.defaultHomeID == account.id)
-            Button("修改密码", systemImage: "key") { openEditor(account, password: true) }
-            Button("修改图标", systemImage: "photo") {
-                Task {
-                    guard await app.unlock(account) else { return }
-                    iconEditing = account.id
-                }
-            }
-            Button(account.isEncrypted ? "取消加密" : "加密", systemImage: account.isEncrypted ? "lock.open" : "lock") {
-                toggleEncryption(account)
-            }
-            moveButtons(for: account)
-            Button("删除", systemImage: "trash", role: .destructive) { pendingDelete = account }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(account.name)的操作")
+            .padding(.trailing, 4)
+            .padding(.bottom, 2)
+            #endif
         }
+        .contextMenu { serverActions(for: account) }
+    }
+
+    private var cardSpacer: CGFloat {
+        #if os(iOS)
+        16
+        #else
+        28
+        #endif
+    }
+
+    private var cardHeight: CGFloat {
+        #if os(iOS)
+        112
+        #else
+        118
+        #endif
+    }
+
+    private var cardPadding: CGFloat {
+        #if os(iOS)
+        12
+        #else
+        16
+        #endif
+    }
+
+    private var iconSize: CGFloat {
+        #if os(iOS)
+        36
+        #else
+        44
+        #endif
+    }
+
+    private var bottomFont: Font {
+        #if os(iOS)
+        .caption
+        #else
+        .subheadline
+        #endif
+    }
+
+    @ViewBuilder
+    private func serverActions(for account: ServerAccount) -> some View {
+        Button("服务配置", systemImage: "slider.horizontal.3") { openEditor(account, password: false) }
+        Button(account.aggregationDisabled ? "启用聚合" : "禁用聚合",
+               systemImage: account.aggregationDisabled ? "square.stack.3d.up" : "square.stack.3d.up.slash") {
+            var updated = account
+            updated.aggregationDisabled.toggle()
+            app.update(updated)
+        }
+        Button("设为默认首页", systemImage: "house") {
+            Task { await app.setDefaultHome(account) }
+        }
+        .disabled(app.defaultHomeID == account.id)
+        Button("修改密码", systemImage: "key") { openEditor(account, password: true) }
+        Button("修改图标", systemImage: "photo") {
+            Task {
+                guard await app.unlock(account) else { return }
+                iconEditing = account.id
+            }
+        }
+        Button(account.isEncrypted ? "取消加密" : "加密", systemImage: account.isEncrypted ? "lock.open" : "lock") {
+            toggleEncryption(account)
+        }
+        moveButtons(for: account)
+        Button("删除", systemImage: "trash", role: .destructive) { pendingDelete = account }
     }
 
     private func openEditor(_ account: ServerAccount, password: Bool) {
@@ -392,22 +475,7 @@ struct ServerDetailView: View {
             }
 
             Section("服务器地址") {
-                TextField("主机", text: $host, prompt: Text("必填"))
-                    .urlKeyboard()
-                    .textContentType(.URL)
-                    .plainTextEntry()
-                    .onChange(of: host) { clearError() }
-                TextField("路径", text: $path, prompt: Text("可选"))
-                    .plainTextEntry()
-                    .onChange(of: path) { clearError() }
-                TextField("端口", text: $port, prompt: Text("可选"))
-                    .plainTextEntry()
-                    #if os(iOS)
-                    .keyboardType(.numbersAndPunctuation)
-                    #endif
-                    .onChange(of: port) { clearError() }
-                Toggle("https", isOn: $useHTTPS)
-                    .onChange(of: useHTTPS) { clearError() }
+                ServerAddressFields(host: $host, path: $path, port: $port, useHTTPS: $useHTTPS, onEdit: clearError)
             }
 
             Section("登录信息") {
@@ -430,15 +498,7 @@ struct ServerDetailView: View {
                     LabeledContent("备用线路", value: "\(backupLines.count)")
                 }
                 NavigationLink {
-                    Form {
-                        Stepper(value: $timeout, in: 5 ... 120, step: 5) {
-                            LabeledContent("超时", value: "\(Int(timeout)) 秒")
-                        }
-                        Toggle("允许自签名证书", isOn: $allowsInsecureTLS)
-                    }
-                    .formStyle(.grouped)
-                    .navigationTitle("高级设置")
-                    .inlineNavigationTitle()
+                    ServerAdvancedSettings(timeout: $timeout, allowsInsecureTLS: $allowsInsecureTLS)
                 } label: {
                     Text("高级设置")
                 }
@@ -470,6 +530,17 @@ struct ServerDetailView: View {
         .formStyle(.grouped)
         .disabled(isWorking)
         .animation(.snappy, value: errorText)
+        #if os(iOS)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("取消", role: .cancel) { dismiss() }
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("保存") { commit(force: false) }
+                    .disabled(isWorking || host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        #else
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack {
                 Spacer()
@@ -483,6 +554,7 @@ struct ServerDetailView: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
         }
+        #endif
         .task {
             guard !didLoad else { return }
             didLoad = true
@@ -516,6 +588,7 @@ struct ServerDetailView: View {
 
     private func commit(force: Bool) {
         guard let account, !isWorking else { return }
+        ServerAddress.absorb(host: &host, path: &path, port: &port, https: &useHTTPS)
         let portText = port.trimmingCharacters(in: .whitespacesAndNewlines)
         if !portText.isEmpty, Int(portText).map({ (1 ... 65535).contains($0) }) != true {
             errorText = "端口应为 1 到 65535 的数字"
@@ -548,52 +621,66 @@ struct ServerDetailView: View {
         isWorking = true
         errorText = nil
         canForce = false
+        let shouldConnect = !force && (addressChanged || !secret.isEmpty || userChanged)
         Task {
             defer { isWorking = false }
-            var updated = account
-            updated.name = finalName
-            updated.note = finalNote
-            updated.baseURL = url
-            updated.backupLines = backupLines
-            if updated.activeLineID != nil, !backupLines.contains(where: { $0.id == updated.activeLineID }) {
-                updated.activeLineID = nil
-            }
-            updated.advanced = ServerAdvanced(timeout: timeout, allowsInsecureTLS: allowsInsecureTLS)
-            var newToken: String?
-            do {
-                if !force, addressChanged || !secret.isEmpty || userChanged {
-                    if account.kind == .plex {
-                        if addressChanged || !secret.isEmpty {
-                            try await validatePlex(url: url, token: secret.isEmpty ? account.token ?? "" : secret)
-                            if !secret.isEmpty { newToken = secret }
+            let targets = shouldConnect ? await ServerEndpoint.candidates(for: url, alternatePorts: []) : [url]
+            var lastError: Error?
+            for target in targets {
+                var updated = account
+                updated.name = finalName
+                updated.note = finalNote
+                updated.baseURL = target
+                updated.backupLines = backupLines
+                if updated.activeLineID != nil, !backupLines.contains(where: { $0.id == updated.activeLineID }) {
+                    updated.activeLineID = nil
+                }
+                updated.advanced = ServerAdvanced(timeout: timeout, allowsInsecureTLS: allowsInsecureTLS)
+                var newToken: String?
+                do {
+                    if shouldConnect {
+                        if account.kind == .plex {
+                            if addressChanged || !secret.isEmpty {
+                                try await validatePlex(url: target, token: secret.isEmpty ? account.token ?? "" : secret)
+                                if !secret.isEmpty { newToken = secret }
+                            }
+                        } else if !secret.isEmpty || userChanged {
+                            let result = try await JellyfinClient.authenticate(baseURL: target, kind: account.kind, username: finalUser, password: secret,
+                                                                               allowsInsecureTLS: allowsInsecureTLS, timeout: timeout)
+                            updated.userID = result.userID
+                            updated.username = result.username
+                            newToken = result.token
+                        } else if addressChanged {
+                            let kind = try await JellyfinClient.probe(baseURL: target, timeout: timeout, allowsInsecureTLS: allowsInsecureTLS).0
+                            guard kind == account.kind else {
+                                errorText = "该地址是\(kind.displayName)服务器，与原来的\(account.kind.displayName)不一致，请添加为新服务器。"
+                                return
+                            }
+                            _ = try await ServerHealth.client(for: updated).libraries()
                         }
-                    } else if !secret.isEmpty || userChanged {
-                        let result = try await JellyfinClient.authenticate(baseURL: url, kind: account.kind, username: finalUser, password: secret,
-                                                                           allowsInsecureTLS: allowsInsecureTLS)
-                        updated.userID = result.userID
-                        updated.username = result.username
-                        newToken = result.token
-                    } else if addressChanged {
-                        let kind = try await JellyfinClient.probe(baseURL: url, timeout: 8, allowsInsecureTLS: allowsInsecureTLS).0
-                        guard kind == account.kind else {
-                            errorText = "该地址是\(kind.displayName)服务器，与原来的\(account.kind.displayName)不一致，请添加为新服务器。"
-                            return
-                        }
-                        _ = try await ServerHealth.client(for: updated).libraries()
                     }
+                    if newToken == nil { updated.username = finalUser }
+                    app.update(updated, token: newToken)
+                    dismiss()
+                    return
+                } catch let error where ServerEndpoint.isUnreachable(error) {
+                    lastError = error
+                } catch APIError.unauthorized {
+                    if !secret.isEmpty || userChanged {
+                        errorText = account.kind == .plex ? "Token 无效或无权访问这台服务器" : "用户名或密码不正确"
+                    } else {
+                        errorText = "能连上该地址，但当前登录在这台服务器上无效，可能不是同一台服务器。"
+                        canForce = true
+                    }
+                    return
+                } catch {
+                    errorText = friendlyMessage(for: error)
+                    canForce = addressChanged && secret.isEmpty
+                    return
                 }
-                if newToken == nil { updated.username = finalUser }
-                app.update(updated, token: newToken)
-                dismiss()
-            } catch APIError.unauthorized {
-                if !secret.isEmpty || userChanged {
-                    errorText = account.kind == .plex ? "Token 无效或无权访问这台服务器" : "用户名或密码不正确"
-                } else {
-                    errorText = "能连上该地址，但当前登录在这台服务器上无效，可能不是同一台服务器。"
-                    canForce = true
-                }
-            } catch {
-                errorText = friendlyMessage(for: error)
+            }
+            if let lastError {
+                errorText = friendlyMessage(for: lastError)
                 canForce = addressChanged && secret.isEmpty
             }
         }

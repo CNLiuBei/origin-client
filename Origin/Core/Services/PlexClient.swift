@@ -6,7 +6,7 @@ final class PlexClient: MediaServerClient {
     private let token: String?
     private var genreKeys: [String: [String: String]] = [:]
 
-    var supportsFavorites: Bool { false }
+    var supportsFavorites: Bool { true }
     var supportsHLS: Bool { true }
     var supportsLibraryQuery: Bool { true }
 
@@ -185,7 +185,8 @@ final class PlexClient: MediaServerClient {
             case .unplayed: params[kind == .tvShows ? "unwatchedLeaves" : "unwatched"] = "1"
             case .played: params[kind == .tvShows ? "unwatchedLeaves" : "unwatched"] = "0"
             case .resumable: params["inProgress"] = "1"
-            case .all, .favorites: break
+            case .all: break
+            case .favorites: params["favorite"] = "1"
             }
             if let genre = query.genre {
                 params["genre"] = genreKeys[parentID]?[genre] ?? genre
@@ -229,7 +230,28 @@ final class PlexClient: MediaServerClient {
         try await metadata("/library/metadata/\(item.seriesID ?? item.id)/similar", ["count": "\(limit)"])
     }
 
-    func favorites() async throws -> [MediaItem] { [] }
+    func favorites() async throws -> [MediaItem] {
+        var items: [MediaItem] = []
+        for library in try await libraries() {
+            let type = library.kind == .tvShows ? "2" : "1"
+            let page = (try? await metadata("/library/sections/\(library.id)/all", ["favorite": "1", "type": type])) ?? []
+            items.append(contentsOf: page)
+        }
+        return items
+    }
+
+    func segments(for item: MediaItem) async -> [MediaSegment] {
+        guard let markers = try? await container("/library/metadata/\(item.id)", ["includeMarkers": "1"]).metadata?.first?.marker?.values else {
+            return []
+        }
+        let mapped = markers.compactMap { marker -> MediaSegment? in
+            guard let type = marker.type, let kind = MediaSegment.Kind.fromServer(type),
+                  let start = marker.startTimeOffset, let end = marker.endTimeOffset else { return nil }
+            return MediaSegment(id: marker.id.map(String.init) ?? "\(type)-\(start)", kind: kind,
+                                start: TimeInterval(start) / 1000, end: TimeInterval(end) / 1000)
+        }
+        return MediaSegment.sanitized(mapped)
+    }
 
     func search(_ term: String, limit: Int) async throws -> [MediaItem] {
         let result = try await container("/hubs/search", ["query": term, "limit": "\(limit)", "includeGuids": "1"])
@@ -244,8 +266,9 @@ final class PlexClient: MediaServerClient {
         _ = try await http.data(baseURL.appending(path: path, query: ["identifier": "com.plexapp.plugins.library", "key": item.id]), headers: headers)
     }
 
-    func setFavorite(_: Bool, item _: MediaItem) async throws {
-        throw APIError.message("Plex 不支持收藏")
+    func setFavorite(_ favorite: Bool, item: MediaItem) async throws {
+        let url = baseURL.appending(path: "/library/metadata/\(item.id)", query: ["favorite": favorite ? "1" : "0"])
+        _ = try await http.data(url, method: "PUT", headers: headers)
     }
 
     // MARK: - 播放
@@ -345,6 +368,7 @@ final class PlexClient: MediaServerClient {
         } else {
             user.isPlayed = (m.viewCount ?? 0) > 0
         }
+        user.isFavorite = m.userState?.favorite?.value ?? m.favorite?.value ?? false
 
         let sources = (m.media ?? []).enumerated().compactMap { index, media -> MediaSourceInfo? in
             guard let part = media.part?.first else { return nil }
@@ -435,6 +459,50 @@ private struct PlexContainer: Decodable {
         case directory = "Directory"
         case hub = "Hub"
     }
+}
+
+/// Plex 有时把单个 Marker 放成对象，有时放成数组
+private struct PlexMarkers: Decodable {
+    struct Marker: Decodable {
+        let id: Int?
+        let type: String?
+        let startTimeOffset: Int?
+        let endTimeOffset: Int?
+    }
+
+    let values: [Marker]
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let many = try? container.decode([Marker].self) {
+            values = many
+        } else if let one = try? container.decode(Marker.self) {
+            values = [one]
+        } else {
+            values = []
+        }
+    }
+}
+
+private struct PlexFlag: Decodable {
+    let value: Bool
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let flag = try? container.decode(Bool.self) {
+            value = flag
+        } else if let number = try? container.decode(Int.self) {
+            value = number != 0
+        } else if let text = try? container.decode(String.self) {
+            value = text == "1" || text.lowercased() == "true"
+        } else {
+            value = false
+        }
+    }
+}
+
+private struct PlexUserState: Decodable {
+    let favorite: PlexFlag?
 }
 
 private struct PlexMetadata: Decodable {
@@ -534,6 +602,9 @@ private struct PlexMetadata: Decodable {
     let viewCount: Int?
     let viewOffset: Int?
     let addedAt: Int?
+    let favorite: PlexFlag?
+    let userState: PlexUserState?
+    let marker: PlexMarkers?
     let genre: [Tag]?
     let role: [Role]?
     let guid: [Guid]?
@@ -544,7 +615,8 @@ private struct PlexMetadata: Decodable {
         case ratingKey, type, title, originalTitle, summary, tagline, year, parentYear, originallyAvailableAt
         case duration, rating, audienceRating, contentRating, studio, thumb, art, parentThumb, grandparentThumb
         case grandparentArt, parentTitle, grandparentTitle, parentRatingKey, grandparentRatingKey, parentIndex
-        case index, leafCount, viewedLeafCount, childCount, viewCount, viewOffset, addedAt
+        case index, leafCount, viewedLeafCount, childCount, viewCount, viewOffset, addedAt, favorite, userState
+        case marker = "Marker"
         case genre = "Genre"
         case role = "Role"
         case guid = "Guid"

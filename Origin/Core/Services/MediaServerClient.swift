@@ -10,6 +10,70 @@ struct ExternalSubtitle: Hashable, Sendable {
     let isForced: Bool
 }
 
+/// 服务器标记的一段可跳过内容，时间单位为秒
+struct MediaSegment: Hashable, Sendable, Identifiable {
+    enum Kind: String, Sendable {
+        case intro, recap, commercial, credits, preview
+
+        var title: String {
+            switch self {
+            case .intro: "跳过片头"
+            case .recap: "跳过前情"
+            case .commercial: "跳过广告"
+            case .credits: "跳过片尾"
+            case .preview: "跳过预告"
+            }
+        }
+
+        var doneTitle: String {
+            switch self {
+            case .intro: "已跳过片头"
+            case .recap: "已跳过前情"
+            case .commercial: "已跳过广告"
+            case .credits: "已跳过片尾"
+            case .preview: "已跳过预告"
+            }
+        }
+
+        /// 片头、前情和广告用“片头”设置；片尾和预告用“片尾”设置
+        var isOpening: Bool {
+            switch self {
+            case .intro, .recap, .commercial: true
+            case .credits, .preview: false
+            }
+        }
+
+        static func fromServer(_ raw: String) -> Kind? {
+            switch raw.lowercased() {
+            case "intro", "opening": .intro
+            case "recap", "previously": .recap
+            case "commercial", "advertisement", "ad": .commercial
+            case "outro", "credits", "ending", "endcredits": .credits
+            case "preview": .preview
+            default: nil
+            }
+        }
+    }
+
+    let id: String
+    let kind: Kind
+    let start: TimeInterval
+    let end: TimeInterval
+
+    func contains(_ time: TimeInterval) -> Bool {
+        time >= start && time < end - 0.6
+    }
+
+    /// 丢掉过短或长得不像标记的区间
+    static func sanitized(_ segments: [MediaSegment]) -> [MediaSegment] {
+        segments.filter { segment in
+            let length = segment.end - segment.start
+            return segment.start >= 0 && length >= 1 && length <= 20 * 60
+        }
+        .sorted { $0.start < $1.start }
+    }
+}
+
 /// 播放进度上报所需的会话信息
 struct PlaybackReport: Sendable {
     let item: MediaItem
@@ -44,6 +108,8 @@ protocol MediaServerClient: AnyObject, Sendable {
     func similar(to item: MediaItem, limit: Int) async throws -> [MediaItem]
     func favorites() async throws -> [MediaItem]
     func search(_ term: String, limit: Int) async throws -> [MediaItem]
+    /// 片头、片尾、前情、预告。服务器没有标记时返回空数组
+    func segments(for item: MediaItem) async -> [MediaSegment]
     func setPlayed(_ played: Bool, item: MediaItem) async throws
     func setFavorite(_ favorite: Bool, item: MediaItem) async throws
 
@@ -58,6 +124,8 @@ protocol MediaServerClient: AnyObject, Sendable {
 }
 
 extension MediaServerClient {
+    func segments(for item: MediaItem) async -> [MediaSegment] { [] }
+
     /// 剧集中当前单集之后的下一集
     func nextEpisode(after episode: MediaItem) async -> MediaItem? {
         guard episode.kind == .episode, let seriesID = episode.seriesID,

@@ -61,16 +61,16 @@ final class JellyfinClient: MediaServerClient {
         return (kind, info)
     }
 
-    static func authenticate(baseURL: URL, kind: ServerKind, username: String, password: String, allowsInsecureTLS: Bool = false) async throws -> AuthResult {
+    static func authenticate(baseURL: URL, kind: ServerKind, username: String, password: String, allowsInsecureTLS: Bool = false, timeout: TimeInterval = 20) async throws -> AuthResult {
         struct Response: Decodable {
             struct User: Decodable { let id: String; let name: String }
             let user: User
             let accessToken: String
             let serverId: String?
         }
-        let (_, info) = try await probe(baseURL: baseURL, allowsInsecureTLS: allowsInsecureTLS)
+        let (_, info) = try await probe(baseURL: baseURL, timeout: timeout, allowsInsecureTLS: allowsInsecureTLS)
         let body = try JSONSerialization.data(withJSONObject: ["Username": username, "Pw": password, "Password": password])
-        let response = try await HTTPClient(allowsInsecureTLS: allowsInsecureTLS).decode(
+        let response = try await HTTPClient(timeout: timeout, allowsInsecureTLS: allowsInsecureTLS).decode(
             Response.self,
             from: baseURL.appending(path: "/Users/AuthenticateByName", query: [:]),
             method: "POST",
@@ -291,6 +291,72 @@ final class JellyfinClient: MediaServerClient {
         ]) { a, _ in a }).items
     }
 
+    func segments(for item: MediaItem) async -> [MediaSegment] {
+        if let remote = try? await get(MediaSegmentsResponse.self, "/MediaSegments/\(item.id)"), !remote.items.isEmpty {
+            return MediaSegment.sanitized(remote.items.compactMap(Self.segment))
+        }
+        return await chapterSegments(for: item)
+    }
+
+    /// 没有 MediaSegments 时，用名为片头/片尾的章节推算区间
+    private func chapterSegments(for item: MediaItem) async -> [MediaSegment] {
+        struct Response: Decodable {
+            struct Chapter: Decodable {
+                let startPositionTicks: Int64
+                let name: String?
+            }
+
+            let chapters: [Chapter]?
+            let runTimeTicks: Int64?
+        }
+        guard let dto = try? await get(Response.self, userPath("/Items/\(item.id)", emby: "/Items/\(item.id)"),
+                                       userQuery.merging(["Fields": "Chapters"]) { current, _ in current }),
+              let chapters = dto.chapters, !chapters.isEmpty else { return [] }
+        let runtime = TimeInterval(dto.runTimeTicks ?? 0) / 10_000_000
+        let sorted = chapters.sorted { $0.startPositionTicks < $1.startPositionTicks }
+        var result: [MediaSegment] = []
+        for (index, chapter) in sorted.enumerated() {
+            guard let kind = Self.chapterKind(chapter.name) else { continue }
+            let start = TimeInterval(chapter.startPositionTicks) / 10_000_000
+            let end: TimeInterval
+            if index + 1 < sorted.count {
+                end = TimeInterval(sorted[index + 1].startPositionTicks) / 10_000_000
+            } else if runtime > start {
+                end = runtime
+            } else {
+                continue
+            }
+            result.append(MediaSegment(id: "chapter-\(index)-\(kind.rawValue)", kind: kind, start: start, end: end))
+        }
+        return MediaSegment.sanitized(result)
+    }
+
+    private static func segment(_ segment: MediaSegmentsResponse.Segment) -> MediaSegment? {
+        guard let kind = MediaSegment.Kind.fromServer(segment.type) else { return nil }
+        return MediaSegment(
+            id: segment.id ?? "\(segment.type)-\(segment.startTicks)",
+            kind: kind,
+            start: TimeInterval(segment.startTicks) / 10_000_000,
+            end: TimeInterval(segment.endTicks) / 10_000_000
+        )
+    }
+
+    /// “Intro End”只是片头的结束点，不能再当成一段片头
+    private static func chapterKind(_ name: String?) -> MediaSegment.Kind? {
+        guard let name = name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !name.isEmpty else { return nil }
+        let intro = name.contains("片头") || name.contains("intro") || name.contains("opening") || name == "op"
+        let recap = name.contains("前情") || name.contains("recap") || name.contains("previously")
+        let preview = name.contains("预告") || name.contains("preview") || name.contains("coming up")
+        let credits = name.contains("片尾") || name.contains("credit") || name.contains("ending") || name == "ed"
+        let endBoundary = (name.contains("end") || name.contains("结束")) && !credits && (intro || recap)
+        if endBoundary { return nil }
+        if recap { return .recap }
+        if preview { return .preview }
+        if intro { return .intro }
+        if credits { return .credits }
+        return nil
+    }
+
     func search(_ term: String, limit: Int) async throws -> [MediaItem] {
         try await fetchItems(userPath("/Items", emby: "/Items"), commonQuery.merging([
             "SearchTerm": term, "Recursive": "true", "IncludeItemTypes": "Movie,Series,Episode,BoxSet",
@@ -497,6 +563,17 @@ final class JellyfinClient: MediaServerClient {
 }
 
 // MARK: - DTO（键名统一由 PascalCase 转为 camelCase）
+
+private struct MediaSegmentsResponse: Decodable {
+    struct Segment: Decodable {
+        let id: String?
+        let type: String
+        let startTicks: Int64
+        let endTicks: Int64
+    }
+
+    let items: [Segment]
+}
 
 private struct ItemsResponse: Decodable {
     let items: [ItemDto]

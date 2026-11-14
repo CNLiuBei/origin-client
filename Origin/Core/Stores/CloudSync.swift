@@ -27,7 +27,23 @@ enum CloudSyncStatus: Equatable {
     case noAccount
     case synced
     case quota
+    case failed
 }
+
+#if os(iOS)
+// iOS SDK 没有公开这两个函数，但系统里有。用来判断签名后的描述文件是否还留着 iCloud 键值存储。
+private typealias OriginSecTask = OpaquePointer
+
+@_silgen_name("SecTaskCreateFromSelf")
+private func OriginSecTaskCreateFromSelf(_ allocator: UnsafeMutableRawPointer?) -> OriginSecTask?
+
+@_silgen_name("SecTaskCopyValueForEntitlement")
+private func OriginSecTaskCopyValueForEntitlement(
+    _ task: OriginSecTask,
+    _ entitlement: CFString,
+    _ error: UnsafeMutableRawPointer?
+) -> CFTypeRef?
+#endif
 
 /// 在同一 iCloud 账号的设备之间同步服务器和播放设置。
 /// 偏好和服务器列表走键值存储，登录令牌走 iCloud 钥匙串。两边都先写本机，离线时不会丢。
@@ -36,6 +52,8 @@ enum CloudSyncStatus: Equatable {
 final class CloudSync: NSObject {
     private(set) var status: CloudSyncStatus = .off
     private(set) var devices: [SyncDevice] = []
+    private(set) var lastSynced: Date?
+    @ObservationIgnored private var keychainWriteOK = true
 
     var enabled: Bool {
         didSet {
@@ -54,16 +72,24 @@ final class CloudSync: NSObject {
 
     /// 个人开发团队的描述文件不能包含 iCloud 能力，这时键值存储不会跨设备同步。
     var isAvailable: Bool {
+        #if os(iOS)
+        guard let task = OriginSecTaskCreateFromSelf(nil) else { return false }
+        return OriginSecTaskCopyValueForEntitlement(task, "com.apple.developer.ubiquity-kvstore-identifier" as CFString, nil) != nil
+        #else
         guard let task = SecTaskCreateFromSelf(nil) else { return false }
         return SecTaskCopyValueForEntitlement(task, "com.apple.developer.ubiquity-kvstore-identifier" as CFString, nil) != nil
+        #endif
     }
+
+    var transportTitle: String { usesKeyValueStore ? "iCloud" : "iCloud 钥匙串" }
 
     var statusTitle: String {
         switch status {
         case .off: "已关闭"
         case .noAccount: "未登录 iCloud"
-        case .synced: "已开启"
+        case .synced: usesKeyValueStore ? "已同步" : "已写入钥匙串"
         case .quota: "iCloud 空间不足"
+        case .failed: "未能写入钥匙串"
         }
     }
 
@@ -75,14 +101,20 @@ final class CloudSync: NSObject {
         return seen
     }
 
+    /// 签名里没有键值存储权限时，改用 iCloud 钥匙串保存同一份同步数据。
+    private var usesKeyValueStore: Bool { isAvailable }
+
     var footer: String {
+        if !isAvailable {
+            return "当前签名没有 iCloud 键值存储，同步通过 iCloud 钥匙串进行。请在系统设置中打开 iCloud 钥匙串。下载仍只留在本机。"
+        }
         switch status {
         case .noAccount:
-            "登录 iCloud 后，服务器和播放设置会同步到这个账号下的 iPhone、iPad 和 Mac。下载仍只留在这台设备。"
+            return "登录 iCloud 后，服务器和播放设置会同步到这个账号下的 iPhone、iPad 和 Mac。下载仍只留在这台设备。"
         case .quota:
-            "iCloud 的同步空间已满，新的更改暂时无法上传。"
+            return "iCloud 的同步空间已满，新的更改暂时无法上传。"
         default:
-            "同步服务器、登录状态和播放设置。各设备可以各自选择当前服务器。观看进度由媒体服务器保存，下载不参与同步。"
+            return "同步服务器、登录状态和播放设置。各设备可以各自选择当前服务器。观看进度由媒体服务器保存，下载不参与同步。"
         }
     }
 
@@ -106,6 +138,7 @@ final class CloudSync: NSObject {
     private static let enabledKey = "serverSyncEnabled"
     private static let accountStampKey = "sync.accountStamps"
     private static let orderStampKey = "sync.accountOrderStamp"
+    private static let keychainBlobKey = "origin.sync-blob"
 
     override init() {
         enabled = defaults.bool(forKey: Self.enabledKey)
@@ -114,10 +147,8 @@ final class CloudSync: NSObject {
 
     func refreshNow() {
         guard enabled else { return }
-        store.synchronize()
-        pull(reason: nil)
-        pushLocalSettings()
-        pushSecrets()
+        if usesKeyValueStore { store.synchronize() }
+        bootstrap()
     }
 
     func start(app: AppModel) {
@@ -138,7 +169,7 @@ final class CloudSync: NSObject {
             status = .off
             return
         }
-        store.synchronize()
+        if usesKeyValueStore { store.synchronize() }
         bootstrap()
     }
 
@@ -156,6 +187,10 @@ final class CloudSync: NSObject {
         guard enabled else { return }
         let now = Date()
         setAccountStamp(now, for: account.id)
+        guard usesKeyValueStore else {
+            reconcileKeychain()
+            return
+        }
         write(AccountEnvelope(id: account.id, updatedAt: now, isDeleted: false, account: account))
         store.synchronize()
     }
@@ -164,18 +199,33 @@ final class CloudSync: NSObject {
         guard enabled else { return }
         let now = Date()
         setAccountStamp(now, for: id)
+        guard usesKeyValueStore else {
+            reconcileKeychain()
+            return
+        }
         write(AccountEnvelope(id: id, updatedAt: now, isDeleted: true, account: nil))
         store.synchronize()
     }
 
     func noteOrderChanged() {
         guard enabled, let app else { return }
+        guard usesKeyValueStore else {
+            writeOrder(app.accounts.map(\.id), updatedAt: Date())
+            reconcileKeychain()
+            return
+        }
         writeOrder(app.accounts.map(\.id), updatedAt: Date())
         store.synchronize()
     }
 
     func flushSettings() {
-        guard enabled, !pendingSettings.isEmpty else { return }
+        guard enabled else { return }
+        guard usesKeyValueStore else {
+            pendingSettings.removeAll()
+            reconcileKeychain()
+            return
+        }
+        guard !pendingSettings.isEmpty else { return }
         let batch = pendingSettings
         pendingSettings.removeAll()
         for (key, entry) in batch {
@@ -204,8 +254,12 @@ final class CloudSync: NSObject {
     @objc nonisolated private func becameActive() {
         Task { @MainActor in
             guard self.enabled else { return }
-            self.store.synchronize()
-            self.pull(reason: nil)
+            if self.usesKeyValueStore {
+                self.store.synchronize()
+                self.pull(reason: nil)
+            } else {
+                self.reconcileKeychain()
+            }
             self.pushSecrets()
         }
     }
@@ -221,9 +275,13 @@ final class CloudSync: NSObject {
             refreshStatus()
             return
         }
-        importLegacyPayload()
-        pull(reason: nil)
-        pushLocalSettings()
+        if usesKeyValueStore {
+            importLegacyPayload()
+            pull(reason: nil)
+            pushLocalSettings()
+        } else {
+            reconcileKeychain()
+        }
         pushSecrets()
         refreshStatus()
     }
@@ -349,7 +407,88 @@ final class CloudSync: NSObject {
             return
         }
         if status == .quota { return }
+        if !usesKeyValueStore, !keychainWriteOK {
+            status = .failed
+            return
+        }
         status = FileManager.default.ubiquityIdentityToken == nil ? .noAccount : .synced
+        if status == .synced { lastSynced = Date() }
+    }
+
+    /// 把另一台设备通过 iCloud 钥匙串送来的记录和本机合并，再写回同一条钥匙串。
+    private func reconcileKeychain() {
+        guard enabled, let app else { return }
+        let settings = app.settings
+        let blob = loadKeychainBlob()
+        if let blob {
+            for (key, record) in blob.settings {
+                let local = settings.localStamp(for: key) ?? .distantPast
+                guard record.updatedAt.timeIntervalSince(local) > 0.001, let value = record.anyValue else { continue }
+                settings.applyRemoteSetting(key, value: value, updatedAt: record.updatedAt)
+            }
+        }
+        for (key, value) in settings.syncSnapshot() where settings.localStamp(for: key) == nil && blob?.settings[key] == nil {
+            if !Self.plistEqual(value, AppSettings.factory[key]) {
+                settings.adoptStamp(key, Date())
+            }
+        }
+        let remoteItems = (blob?.accounts ?? []).map {
+            RemoteAccountState(id: $0.id, updatedAt: $0.updatedAt, isDeleted: $0.isDeleted, account: $0.account)
+        }
+        let plan = AccountSyncPlanner.plan(
+            local: LocalAccountState(
+                accounts: app.accounts,
+                stamps: accountStamps(),
+                orderUpdatedAt: AppSettings.date(defaults.object(forKey: Self.orderStampKey))
+            ),
+            remote: remoteItems,
+            remoteOrder: blob?.order
+        )
+        saveAccountStamps(plan.stamps)
+        if let orderUpdatedAt = plan.orderUpdatedAt {
+            defaults.set(orderUpdatedAt.timeIntervalSince1970, forKey: Self.orderStampKey)
+        }
+        if plan.accounts != app.accounts {
+            app.replaceAccountsFromSync(plan.accounts)
+        }
+        var deviceMap = Dictionary(uniqueKeysWithValues: (blob?.devices ?? []).map { ($0.id, $0) })
+        let me = SyncDevice(id: DeviceInfo.deviceID, name: DeviceInfo.deviceName, kind: Self.thisKind, seen: Date())
+        deviceMap[me.id] = me
+        let cutoff = Date().addingTimeInterval(-90 * 24 * 60 * 60)
+        devices = deviceMap.values.filter { $0.seen > cutoff }.sorted { $0.seen > $1.seen }
+
+        var settingsOut: [String: KeychainSetting] = [:]
+        for (key, value) in settings.syncSnapshot() {
+            guard let stamp = settings.localStamp(for: key) else { continue }
+            settingsOut[key] = KeychainSetting(updatedAt: stamp, value: value)
+        }
+        var envelopes = app.accounts.map { account in
+            AccountEnvelope(id: account.id, updatedAt: accountStamps()[account.id] ?? Date(), isDeleted: false, account: account)
+        }
+        for (id, stamp) in accountStamps() where !app.accounts.contains(where: { $0.id == id }) {
+            envelopes.append(AccountEnvelope(id: id, updatedAt: stamp, isDeleted: true, account: nil))
+        }
+        for item in remoteItems where item.isDeleted && !envelopes.contains(where: { $0.id == item.id }) {
+            envelopes.append(AccountEnvelope(id: item.id, updatedAt: item.updatedAt, isDeleted: true, account: nil))
+        }
+        let order = OrderEnvelope(
+            updatedAt: AppSettings.date(defaults.object(forKey: Self.orderStampKey)) ?? Date(),
+            ids: app.accounts.map(\.id)
+        )
+        let outgoing = KeychainSyncBlob(accounts: envelopes, order: order, settings: settingsOut, devices: devices)
+        if let data = try? encoder.encode(outgoing) {
+            keychainWriteOK = Keychain.setData(data, for: Self.keychainBlobKey, synchronizable: true)
+        } else {
+            keychainWriteOK = false
+        }
+        // 服务器资料在同步包里，登录令牌是另一条钥匙串。合并账号后要把令牌取回本机，否则请求不带 Token。
+        pullSecrets()
+    }
+
+    private func loadKeychainBlob() -> KeychainSyncBlob? {
+        let data = Keychain.synchronizableData(for: Self.keychainBlobKey) ?? Keychain.data(for: Self.keychainBlobKey)
+        guard let data else { return nil }
+        return try? decoder.decode(KeychainSyncBlob.self, from: data)
     }
 
     private func remoteSetting(_ key: String) -> (date: Date, value: Any)? {
@@ -431,6 +570,7 @@ final class CloudSync: NSObject {
     }
 
     private func settingKey(_ key: String) -> String { "setting.\(key)" }
+
     private func accountKey(_ id: UUID) -> String { "account.item.\(id.uuidString)" }
 
     private static func plistEqual(_ lhs: Any?, _ rhs: Any?) -> Bool {
@@ -579,5 +719,40 @@ private enum AccountSyncPlanner {
             }
         }
         return (kept, stamps, tombstones)
+    }
+}
+
+private struct KeychainSyncBlob: Codable {
+    var accounts: [AccountEnvelope]
+    var order: OrderEnvelope?
+    var settings: [String: KeychainSetting]
+    var devices: [SyncDevice]
+}
+
+private struct KeychainSetting: Codable {
+    var updatedAt: Date
+    var text: String?
+    var integer: Int?
+    var number: Double?
+    var flag: Bool?
+
+    init(updatedAt: Date, value: Any) {
+        self.updatedAt = updatedAt
+        if let value = value as? Bool {
+            flag = value
+        } else if let value = value as? Int {
+            integer = value
+        } else if let value = value as? Double {
+            number = value
+        } else if let value = value as? String {
+            text = value
+        }
+    }
+
+    var anyValue: Any? {
+        if let flag { return flag }
+        if let integer { return integer }
+        if let number { return number }
+        return text
     }
 }

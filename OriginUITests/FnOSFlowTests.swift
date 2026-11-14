@@ -184,8 +184,8 @@ final class FnOSFlowTests: XCTestCase {
         let addButton = app.buttons["添加媒体服务器"]
         XCTAssertTrue(addButton.waitForExistence(timeout: 5), "需要从未添加服务器的状态开始")
         addButton.tap()
-        app.buttons["manual-account"].tap()
-        let addressField = app.textFields["server-address"]
+        app.buttons["manual-fnos"].tap()
+        let addressField = app.textFields["server-host"]
         XCTAssertTrue(addressField.waitForExistence(timeout: 5))
         addressField.tap()
         addressField.typeText(address)

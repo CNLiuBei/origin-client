@@ -1,0 +1,7 @@
+# 复制为 Config/Signing.local 后按自己的 Apple ID 修改。这个 example 可以提交，Signing.local 不要提交。
+#
+# 团队号是 10 位，在 Xcode → Settings → Accounts 里点你的 Apple ID，看 Team 后面的 ID。
+# DEVELOPMENT_TEAM=XXXXXXXXXX
+#
+# 不写 Bundle ID 时：工程原团队继续用 com.cn.Origin，其他团队自动用 com.cn.Origin.<团队号>。
+# PRODUCT_BUNDLE_IDENTIFIER=com.example.Origin

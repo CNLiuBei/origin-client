@@ -59,6 +59,11 @@ enum ImageLoader {
         cache.object(forKey: url as NSURL)
     }
 
+    static func clearMemory() {
+        cache.removeAllObjects()
+        AmbientBlur.clearMemory()
+    }
+
     static func load(_ url: URL) async -> PlatformImage? {
         if let cached = cached(url) { return cached }
         guard let (data, response) = try? await URLSession.shared.data(for: MediaRequestAuth.request(for: url)),
@@ -463,6 +468,10 @@ struct AmbientBackground: View {
 
 enum AmbientBlur {
     private static let cache = NSCache<NSURL, PlatformImage>()
+
+    static func clearMemory() {
+        cache.removeAllObjects()
+    }
     private nonisolated static let context = CIContext(options: [.useSoftwareRenderer: false])
 
     static func image(for url: URL) async -> PlatformImage? {
@@ -487,6 +496,7 @@ enum AmbientBlur {
 struct ResumeCard: View {
     @Environment(AppModel.self) private var app
     let item: MediaItem
+    var serverName: String? = nil
 
     var body: some View {
         Button {
@@ -524,6 +534,12 @@ struct ResumeCard: View {
                     Text(subtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if let serverName {
+                    Text(serverName)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                         .lineLimit(1)
                 }
             }
@@ -584,6 +600,11 @@ struct ItemContextMenu: View {
             if item.isResumable {
                 Button("从头播放", systemImage: "arrow.counterclockwise") { app.player.play(item, resume: false) }
             }
+            if app.downloads.record(for: item.id) == nil {
+                Button("下载", systemImage: "arrow.down.circle") {
+                    Task { await download(item) }
+                }
+            }
         }
         Button(item.userState.isPlayed ? "标记为未看" : "标记为已看",
                systemImage: item.userState.isPlayed ? "eye.slash" : "checkmark.circle") {
@@ -595,5 +616,16 @@ struct ItemContextMenu: View {
                 Task { try? await app.toggleFavorite(item) }
             }
         }
+    }
+
+    /// 列表里的条目通常没有直链，先把详情补全再交给下载
+    private func download(_ item: MediaItem) async {
+        let full: MediaItem
+        if item.mediaSources.contains(where: { $0.directURL != nil }) {
+            full = item
+        } else {
+            full = (try? await app.client(for: item.serverID)?.item(id: item.id)) ?? item
+        }
+        app.downloads.download(full)
     }
 }

@@ -13,6 +13,7 @@ struct HomeView: View {
     @State private var libraries: [MediaLibrary] = []
     @State private var isLoading = true
     @State private var errorText: String?
+    @State private var partialError: String?
     @State private var loadedRevision: Int?
 
     struct LibraryShelf: Identifiable {
@@ -24,20 +25,29 @@ struct HomeView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 28) {
+                if let partialError {
+                    Label(partialError, systemImage: "wifi.exclamationmark")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(.regularMaterial, in: .rect(cornerRadius: 12))
+                        .padding(.horizontal)
+                }
                 if !featured.isEmpty {
                     FeaturedCarousel(items: featured, selection: $featuredSelection)
                 }
                 if !resume.isEmpty {
                     Shelf(title: "继续观看") {
                         ForEach(resume) { item in
-                            ResumeCard(item: item).frame(width: resumeWidth)
+                            ResumeCard(item: item, serverName: serverName(for: item)).frame(width: resumeWidth)
                         }
                     }
                 }
                 if !nextUp.isEmpty {
                     Shelf(title: "下一集") {
                         ForEach(nextUp) { item in
-                            ResumeCard(item: item).frame(width: resumeWidth)
+                            ResumeCard(item: item, serverName: serverName(for: item)).frame(width: resumeWidth)
                         }
                     }
                 }
@@ -71,7 +81,16 @@ struct HomeView: View {
                     Shelf(title: "收藏", destination: .favorites) {
                         ForEach(favorites) { item in
                             NavigationLink(value: item) {
-                                PosterCard(item: item).frame(width: 130)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    PosterCard(item: item).frame(width: 130)
+                                    if let name = serverName(for: item) {
+                                        Text(name)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                            .frame(width: 130, alignment: .leading)
+                                    }
+                                }
                             }
                             .buttonStyle(.plain)
                             .contextMenu { ItemContextMenu(item: item) }
@@ -115,9 +134,11 @@ struct HomeView: View {
         .navigationTitle(app.activeAccount?.name ?? "首页")
         .toolbarTitleDisplayMode(.inline)
         .toolbar(removing: .title)
+        #if os(macOS)
         .toolbar {
             ToolbarItem(placement: .primaryAction) { ServerMenu() }
         }
+        #endif
         .refreshable { await load() }
         .task(id: app.contentRevision) {
             // 切换标签或从下一级返回时不重复加载，内容有变化（如播放进度更新）才刷新
@@ -129,6 +150,11 @@ struct HomeView: View {
 
     private var resumeWidth: CGFloat { sizeClass == .regular ? 340 : 280 }
 
+    private func serverName(for item: MediaItem) -> String? {
+        guard app.homeAccounts.count > 1 else { return nil }
+        return app.accounts.first { $0.id == item.serverID }?.name
+    }
+
     private func collagePosters(for library: MediaLibrary) -> [URL] {
         let items = latest.first { $0.library.id == library.id }?.items ?? []
         return Array(items.compactMap(\.posterURL).prefix(3))
@@ -138,6 +164,7 @@ struct HomeView: View {
         let accounts = app.homeAccounts
         guard !accounts.isEmpty else {
             isLoading = false
+            partialError = nil
             return
         }
         isLoading = true
@@ -180,6 +207,7 @@ struct HomeView: View {
             featuredSelection = featured.first?.id
         }
         errorText = allLibraries.isEmpty ? failure : nil
+        partialError = allLibraries.isEmpty ? nil : failure.map { "有的服务器暂时连不上：\($0)" }
         if !featured.isEmpty { prefetchFeatured() }
     }
 

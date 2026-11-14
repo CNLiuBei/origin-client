@@ -1,5 +1,6 @@
 import AVKit
 import MediaPlayer
+import SwiftUI
 #if os(iOS)
 import UIKit
 
@@ -7,7 +8,9 @@ import UIKit
 final class NativePlayerHostController: UIViewController {
     let playerController = AVPlayerViewController()
     var onDismiss: (() -> Void)?
-    private let closeButton = UIButton(type: .system)
+    weak var playback: NativePlayerController?
+    private let closeTransition = PlayerCloseTransition()
+    private var overlay: UIHostingController<NativePlayerScreen>?
     private var notified = false
 
     override func viewDidLoad() {
@@ -24,25 +27,52 @@ final class NativePlayerHostController: UIViewController {
             playerController.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
         playerController.didMove(toParent: self)
-
-        let image = UIImage(systemName: "xmark", withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold))
-        closeButton.setImage(image, for: .normal)
-        closeButton.tintColor = .white
-        closeButton.backgroundColor = UIColor.white.withAlphaComponent(0.18)
-        closeButton.layer.cornerRadius = 22
-        closeButton.accessibilityLabel = "关闭播放器"
-        closeButton.translatesAutoresizingMaskIntoConstraints = false
-        closeButton.addTarget(self, action: #selector(close), for: .touchUpInside)
-        view.addSubview(closeButton)
-        NSLayoutConstraint.activate([
-            closeButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
-            closeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
-            closeButton.widthAnchor.constraint(equalToConstant: 44),
-            closeButton.heightAnchor.constraint(equalToConstant: 44),
-        ])
     }
 
-    @objc private func close() { dismiss(animated: true) }
+    func installOverlay(model: NativePlayerController) {
+        let host = UIHostingController(rootView: NativePlayerScreen(model: model))
+        host.view.backgroundColor = .clear
+        host.safeAreaRegions = []
+        host.view.translatesAutoresizingMaskIntoConstraints = false
+        addChild(host)
+        view.addSubview(host.view)
+        NSLayoutConstraint.activate([
+            host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            host.view.topAnchor.constraint(equalTo: view.topAnchor),
+            host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+        host.didMove(toParent: self)
+        overlay = host
+    }
+
+    func removeOverlay() {
+        overlay?.willMove(toParent: nil)
+        overlay?.view.removeFromSuperview()
+        overlay?.removeFromParent()
+        overlay = nil
+    }
+
+    func beginClose(completion: (() -> Void)? = nil) {
+        closeTransition.start(on: self, completion: completion)
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        playback?.preparePictureInPicture()
+    }
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+        if let closing = closeTransition.orientations(for: self) { return closing }
+        return traitCollection.userInterfaceIdiom == .pad ? .all : .landscape
+    }
+
+    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation { .landscapeRight }
+
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        closeTransition.viewWillTransition(on: self, coordinator: coordinator)
+    }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
@@ -62,8 +92,14 @@ final class NativePlayerHostController: UIViewController {
 }
 #endif
 
+@Observable
+final class SkipPromptState {
+    var segment: MediaSegment?
+}
+
 /// 系统原生播放：AVPlayer + AVPlayerViewController（macOS 上为 AVPlayerView）。
 /// 控制栏、画中画、AirPlay、锁屏控制、字幕与音轨菜单全部由系统提供。
+@Observable
 final class NativePlayerController: NSObject {
     private(set) var session: PlaybackSession
     #if os(iOS)
@@ -73,13 +109,48 @@ final class NativePlayerController: NSObject {
     #endif
     private let player = AVPlayer()
     private weak var presenter: PlayerPresenter?
-    private let settings: AppSettings
+    let settings: AppSettings
+    let skipPrompt = SkipPromptState()
+    var rate: Double = 1
+    var controlsVisible = true
+    var isScrubbing = false
+    var scrubTime: TimeInterval = 0
+    var isFill = false
+    var isLocked = false
+    var showInfo = false
+    var showEpisodes = false
+    private(set) var currentTime: TimeInterval = 0
+    private(set) var duration: TimeInterval = 0
+    private(set) var isPlaying = false
+    private(set) var isBuffering = false
+    private(set) var volume: Float = 1
+    private(set) var audioChoices: [PlayerChoice] = []
+    private(set) var audioSelection = ""
+    private(set) var subtitleChoices: [PlayerChoice] = []
+    private(set) var subtitleSelection = ""
+    private(set) var chapterMarks: [PlayerChapterMark] = []
+    var hud: PlayerHUD?
+    @ObservationIgnored private var audioGroup: AVMediaSelectionGroup?
+    @ObservationIgnored private var audioOptions: [AVMediaSelectionOption] = []
+    @ObservationIgnored private var subtitleGroup: AVMediaSelectionGroup?
+    @ObservationIgnored private var subtitleOptions: [AVMediaSelectionOption] = []
+    @ObservationIgnored private var pipController: AVPictureInPictureController?
+    @ObservationIgnored private var hideTask: Task<Void, Never>?
+    @ObservationIgnored private var hudTask: Task<Void, Never>?
+    @ObservationIgnored private var rateBeforeLongPress: Double?
+    @ObservationIgnored private var panStartTime: TimeInterval = 0
+    @ObservationIgnored private var panStartValue: Double = 0
+    @ObservationIgnored private var isSwitching = false
+    @ObservationIgnored private var timeControlObservation: NSKeyValueObservation?
+    #if os(iOS)
+    @ObservationIgnored let volumeController = SystemVolumeController()
+    #endif
 
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var interruptionObserver: NSObjectProtocol?
     private var statusObservation: NSKeyValueObservation?
-    private var isPiPActive = false
+    private(set) var isPictureInPicture = false
     private var isFinished = false
     /// 续播位置只跳一次。否则用户再拖回开头时，ready 回调会把进度拉回记忆点。
     private var didApplyStart = false
@@ -91,26 +162,28 @@ final class NativePlayerController: NSObject {
         self.session = session
         self.presenter = presenter
         self.settings = settings
+        rate = settings.defaultRate
         super.init()
         #if os(iOS)
         let playerController = viewController.playerController
         playerController.player = player
         playerController.delegate = self
-        playerController.showsPlaybackControls = true
+        playerController.showsPlaybackControls = false
         playerController.videoGravity = .resizeAspect
-        playerController.allowsPictureInPicturePlayback = true
+        playerController.allowsPictureInPicturePlayback = false
         playerController.canStartPictureInPictureAutomaticallyFromInline = true
         playerController.updatesNowPlayingInfoCenter = true
         playerController.entersFullScreenWhenPlaybackBegins = false
         playerController.exitsFullScreenWhenPlaybackEnds = false
         playerController.speeds = Self.playbackSpeeds
-        viewController.modalPresentationStyle = .fullScreen
+        viewController.modalPresentationStyle = .overFullScreen
+        viewController.modalPresentationCapturesStatusBarAppearance = true
         viewController.onDismiss = { [weak self] in self?.handleDismiss() }
         observeInterruptions()
         #else
         playerView.player = player
-        playerView.controlsStyle = .floating
-        playerView.allowsPictureInPicturePlayback = true
+        playerView.controlsStyle = .none
+        playerView.allowsPictureInPicturePlayback = false
         playerView.showsFullScreenToggleButton = true
         playerView.showsSharingServiceButton = false
         playerView.updatesNowPlayingInfoCenter = true
@@ -123,6 +196,10 @@ final class NativePlayerController: NSObject {
         #endif
         applySelectionCriteria()
         load(session)
+        #if os(iOS)
+        viewController.playback = self
+        viewController.installOverlay(model: self)
+        #endif
     }
 
     private static let playbackSpeeds: [AVPlaybackSpeed] = [
@@ -155,6 +232,20 @@ final class NativePlayerController: NSObject {
         isSeekingToStart = false
         didSchedulePlayback = false
         resumeAfterInterruption = false
+        skipPrompt.segment = nil
+        currentTime = 0
+        duration = 0
+        isPlaying = false
+        isScrubbing = false
+        audioChoices = []
+        audioSelection = ""
+        subtitleChoices = []
+        subtitleSelection = ""
+        chapterMarks = []
+        audioGroup = nil
+        audioOptions = []
+        subtitleGroup = nil
+        subtitleOptions = []
 
         var assetOptions: [String: Any] = [:]
         if !session.headers.isEmpty, !session.isOffline {
@@ -172,13 +263,65 @@ final class NativePlayerController: NSObject {
         statusObservation = Self.observeStatus(of: item) { [weak self] item in
             self?.itemStatusChanged(item)
         }
-        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1, preferredTimescale: 600), queue: .main) { [weak self] time in
+        timeControlObservation = Self.observeTimeControl(of: player) { [weak self] status in
+            self?.timeControlChanged(status)
+        }
+        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] time in
             MainActor.assumeIsolated { self?.tick(time) }
         }
         endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: item, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.didPlayToEnd() }
         }
-        player.defaultRate = Float(settings.defaultRate)
+        player.defaultRate = Float(rate)
+    }
+
+    private func loadPresentation(for item: AVPlayerItem) {
+        Task { await loadPresentationData(for: item) }
+    }
+
+    private func loadPresentationData(for item: AVPlayerItem) async {
+        guard item == player.currentItem else { return }
+        let asset = item.asset
+        if let group = try? await asset.loadMediaSelectionGroup(for: .audible) {
+            guard item == player.currentItem else { return }
+            audioGroup = group
+            audioOptions = group.options
+            audioChoices = group.options.enumerated().map { index, option in
+                PlayerChoice(id: String(index), title: option.displayName.ifEmpty("音轨 \(index + 1)"))
+            }
+            if let selected = item.currentMediaSelection.selectedMediaOption(in: group),
+               let index = group.options.firstIndex(of: selected) {
+                audioSelection = String(index)
+            }
+        }
+        if let group = try? await asset.loadMediaSelectionGroup(for: .legible) {
+            guard item == player.currentItem else { return }
+            subtitleGroup = group
+            subtitleOptions = group.options
+            subtitleChoices = group.options.enumerated().map { index, option in
+                PlayerChoice(id: String(index), title: option.displayName.ifEmpty("字幕 \(index + 1)"))
+            }
+            if let selected = item.currentMediaSelection.selectedMediaOption(in: group),
+               let index = group.options.firstIndex(of: selected) {
+                subtitleSelection = String(index)
+            } else {
+                subtitleSelection = ""
+            }
+        }
+        // Swift 只暴露了 @concurrent 的 async 版本，主线程上的 asset 不能直接传进去。
+        nonisolated(unsafe) let source = asset
+        let token = ObjectIdentifier(item)
+        Task.detached { [weak self] in
+            let groups = try? await source.loadChapterMetadataGroups(withTitleLocale: .current, containingItemsWithCommonKeys: [.commonKeyTitle])
+            let marks = (groups ?? []).enumerated().map { index, group in
+                let title = (group.items.first { $0.commonKey == .commonKeyTitle }?.value as? String) ?? ""
+                return PlayerChapterMark(id: index, title: title, start: group.timeRange.start.seconds)
+            }
+            await MainActor.run { [weak self] in
+                guard let self, let current = self.player.currentItem, ObjectIdentifier(current) == token else { return }
+                self.chapterMarks = marks
+            }
+        }
     }
 
     /// KVO 可能在任意线程回调，观察闭包本身必须是非隔离的
@@ -186,6 +329,18 @@ final class NativePlayerController: NSObject {
         item.observe(\.status, options: [.new]) { item, _ in
             Task { @MainActor in handler(item) }
         }
+    }
+
+    private nonisolated static func observeTimeControl(of player: AVPlayer, handler: @escaping @MainActor (AVPlayer.TimeControlStatus) -> Void) -> NSKeyValueObservation {
+        player.observe(\.timeControlStatus, options: [.initial, .new]) { player, _ in
+            let status = player.timeControlStatus
+            Task { @MainActor in handler(status) }
+        }
+    }
+
+    private func timeControlChanged(_ status: AVPlayer.TimeControlStatus) {
+        isPlaying = status == .playing
+        isBuffering = status == .waitingToPlayAtSpecifiedRate
     }
 
     private func itemStatusChanged(_ item: AVPlayerItem) {
@@ -216,6 +371,8 @@ final class NativePlayerController: NSObject {
                 }
             }
             session.didStart()
+            loadPresentation(for: item)
+            scheduleHide()
         case .failed:
             presenter?.report(error: Self.playbackMessage(for: item.error))
             dismiss()
@@ -226,6 +383,7 @@ final class NativePlayerController: NSObject {
 
     private func beginPlayback() {
         player.play()
+        if abs(rate - 1) > 0.01 { player.rate = Float(rate) }
     }
 
     private static func playbackMessage(for error: Error?) -> String {
@@ -244,16 +402,38 @@ final class NativePlayerController: NSObject {
         let seconds = time.seconds
         guard seconds.isFinite else { return }
         if isSeekingToStart { return }
-        let duration = player.currentItem?.duration.seconds ?? 0
-        session.update(position: seconds, duration: duration.isFinite ? duration : 0,
-                       paused: player.timeControlStatus == .paused)
+        currentTime = seconds
+        let length = player.currentItem?.duration.seconds ?? 0
+        duration = length.isFinite ? length : 0
+        session.update(position: seconds, duration: self.duration, paused: !isPlaying)
+        _ = session.considerSegments(at: seconds, intro: settings.skipIntro, credits: settings.skipCredits) { [weak self] time in
+            self?.seek(to: time)
+        }
+        if skipPrompt.segment?.id != session.skipPrompt?.id {
+            skipPrompt.segment = session.skipPrompt
+        }
+    }
+
+    func skipCurrentSegment() {
+        _ = session.skipPromptedSegment { [weak self] time in
+            self?.seek(to: time)
+        }
+        skipPrompt.segment = session.skipPrompt
+    }
+
+    func seek(to time: TimeInterval) {
+        var target = max(0, time)
+        if duration > 0 { target = min(target, duration) }
+        currentTime = target
+        player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        session.update(position: target, duration: duration, paused: !isPlaying, force: true)
     }
 
     private func didPlayToEnd() {
         session.update(position: session.duration, duration: session.duration, paused: true, force: true)
         session.stop()
         guard settings.autoPlayNext, let next = session.nextItem, let presenter else {
-            if !isPiPActive { dismiss() }
+            if !isPictureInPicture { dismiss() }
             return
         }
         Task {
@@ -269,14 +449,14 @@ final class NativePlayerController: NSObject {
                 }
             } catch {
                 presenter.report(error: error.localizedDescription)
-                if !isPiPActive { dismiss() }
+                if !isPictureInPicture { dismiss() }
             }
         }
     }
 
     private func dismiss(then completion: (() -> Void)? = nil) {
         #if os(iOS)
-        viewController.dismiss(animated: true, completion: completion)
+        viewController.beginClose(completion: completion)
         #else
         presenter?.dismissPlayerWindow()
         completion?()
@@ -284,7 +464,7 @@ final class NativePlayerController: NSObject {
     }
 
     func handleDismiss() {
-        guard !isPiPActive else { return }
+        guard !isPictureInPicture else { return }
         finish()
     }
 
@@ -301,32 +481,273 @@ final class NativePlayerController: NSObject {
         interruptionObserver = nil
         player.replaceCurrentItem(with: nil)
         PlaybackAudioSession.deactivate()
+        #if os(iOS)
+        viewController.removeOverlay()
+        #endif
         presenter?.nativeDidFinish(self)
     }
 
-    #if os(macOS)
-    // MARK: - 菜单栏控制
+    var displayTime: TimeInterval { isScrubbing ? scrubTime : currentTime }
+    var supportsSubtitleDelay: Bool { false }
+    var subtitleDelay: Double { 0 }
+    var engineName: String { "系统" }
+
+    func setSubtitleDelay(_ value: Double) {}
+
+    func liveStatRows() -> [(String, String)] { [] }
 
     func togglePlay() {
-        if player.timeControlStatus == .paused { player.play() } else { player.pause() }
+        if isPlaying {
+            player.pause()
+            isPlaying = false
+        } else {
+            if duration > 0, currentTime >= duration - 0.5 { seek(to: 0) }
+            player.play()
+            if abs(rate - 1) > 0.01 { player.rate = Float(rate) }
+            isPlaying = true
+        }
+        showControls()
     }
 
     func skip(_ seconds: Int) {
-        let duration = player.currentItem?.duration.seconds ?? 0
-        var target = max(0, player.currentTime().seconds + Double(seconds))
-        if duration.isFinite, duration > 0 { target = min(target, duration) }
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        let upper = duration > 0 ? duration : currentTime + Double(max(seconds, 0))
+        seek(to: min(max(0, currentTime + Double(seconds)), upper))
+        flash(.skip(seconds))
+    }
+
+    func setRate(_ value: Double) {
+        rate = value
+        player.defaultRate = Float(value)
+        if isPlaying { player.rate = Float(value) }
+    }
+
+    func setVolume(_ value: Float) {
+        volume = max(0, min(1, value))
+        player.volume = volume
     }
 
     func adjustVolume(by delta: Float) {
-        player.volume = max(0, min(1, player.volume + delta))
+        setVolume(volume + delta)
+        flash(.volume(Double(volume)))
     }
 
-    var currentTime: TimeInterval { player.currentTime().seconds }
-    var duration: TimeInterval { player.currentItem?.duration.seconds ?? 0 }
-    var isPlaying: Bool { player.timeControlStatus == .playing }
-    var volume: Float { player.volume }
+    func selectAudio(_ id: String) {
+        guard let group = audioGroup, let index = Int(id), audioOptions.indices.contains(index) else { return }
+        player.currentItem?.select(audioOptions[index], in: group)
+        audioSelection = id
+    }
+
+    func selectSubtitle(_ id: String) {
+        guard let group = subtitleGroup else { return }
+        if id.isEmpty {
+            player.currentItem?.select(nil, in: group)
+            subtitleSelection = ""
+            return
+        }
+        guard let index = Int(id), subtitleOptions.indices.contains(index) else { return }
+        player.currentItem?.select(subtitleOptions[index], in: group)
+        subtitleSelection = id
+    }
+
+    func toggleFill() {
+        isFill.toggle()
+        #if os(iOS)
+        viewController.playerController.videoGravity = isFill ? .resizeAspectFill : .resizeAspect
+        #else
+        playerView.videoGravity = isFill ? .resizeAspectFill : .resizeAspect
+        #endif
+        flash(.message(isFill ? "填充屏幕" : "适应屏幕"))
+    }
+
+    func toggleLock() {
+        isLocked.toggle()
+        showControls()
+    }
+
+    func togglePiP() {
+        preparePictureInPicture()
+        guard let pipController else { return }
+        if pipController.isPictureInPictureActive {
+            pipController.stopPictureInPicture()
+        } else {
+            pipController.startPictureInPicture()
+        }
+    }
+
+    func preparePictureInPicture() {
+        guard pipController == nil else { return }
+        #if os(iOS)
+        let layer = Self.playerLayer(in: viewController.playerController.view)
+        #else
+        let layer = Self.playerLayer(in: playerView)
+        #endif
+        guard let layer else { return }
+        let controller = AVPictureInPictureController(contentSource: .init(playerLayer: layer))
+        controller.delegate = self
+        #if os(iOS)
+        controller.canStartPictureInPictureAutomaticallyFromInline = true
+        #endif
+        pipController = controller
+    }
+
+    func close() {
+        if !isPictureInPicture { player.pause() }
+        #if os(iOS)
+        viewController.beginClose()
+        #else
+        presenter?.dismissPlayerWindow()
+        #endif
+    }
+
+    func playNext() {
+        guard let next = session.nextItem else { return }
+        play(next, resume: false)
+    }
+
+    func play(_ item: MediaItem, resume: Bool? = nil) {
+        guard let presenter, !isSwitching, !isFinished else { return }
+        isSwitching = true
+        Task {
+            defer { isSwitching = false }
+            do {
+                let next = try await presenter.makeSession(for: item, resume: resume)
+                guard !isFinished else { return }
+                if next.engine == .native {
+                    load(next)
+                } else {
+                    finish()
+                    dismiss { presenter.present(next) }
+                }
+            } catch {
+                presenter.report(error: error.localizedDescription)
+            }
+        }
+    }
+
+    func showControls(autoHide: Bool = true) {
+        withAnimation(.easeOut(duration: 0.2)) { controlsVisible = true }
+        if autoHide { scheduleHide() } else { hideTask?.cancel() }
+    }
+
+    func toggleControls() {
+        if controlsVisible {
+            hideTask?.cancel()
+            withAnimation(.easeOut(duration: 0.2)) { controlsVisible = false }
+        } else {
+            showControls()
+        }
+    }
+
+    func scheduleHide() {
+        hideTask?.cancel()
+        hideTask = Task {
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled, isPlaying, !isScrubbing else { return }
+            withAnimation(.easeOut(duration: 0.3)) { controlsVisible = false }
+        }
+    }
+
+    func flash(_ value: PlayerHUD, duration: Double = 0.8) {
+        hud = value
+        hudTask?.cancel()
+        hudTask = Task {
+            try? await Task.sleep(for: .seconds(duration))
+            guard !Task.isCancelled else { return }
+            withAnimation { hud = nil }
+        }
+    }
+
+    #if os(iOS)
+    func handleDoubleTap(xFraction: CGFloat) {
+        guard !isLocked else { return }
+        if xFraction < 0.35 {
+            skip(-settings.skipBackward)
+        } else if xFraction > 0.65 {
+            skip(settings.skipForward)
+        } else {
+            togglePlay()
+        }
+    }
+
+    func handlePan(_ phase: PlayerGestureView.PanPhase) {
+        guard !isLocked else { return }
+        switch phase {
+        case let .began(axis, xFraction):
+            switch axis {
+            case .horizontal:
+                panStartTime = currentTime
+            case .vertical:
+                panStartValue = xFraction < 0.5 ? volumeController.brightness : Double(volumeController.volume)
+            }
+        case let .changed(axis, xFraction, translation, size):
+            switch axis {
+            case .horizontal:
+                let span = min(max(duration * 0.2, 90), 600)
+                let target = max(0, min(duration, panStartTime + Double(translation.x / size.width) * span))
+                hud = .seek(target: target, delta: target - panStartTime)
+                hudTask?.cancel()
+            case .vertical:
+                let value = max(0, min(1, panStartValue - Double(translation.y / size.height) * 1.2))
+                if xFraction < 0.5 {
+                    volumeController.brightness = value
+                    hud = .brightness(value)
+                } else {
+                    volumeController.volume = Float(value)
+                    hud = .volume(value)
+                }
+                hudTask?.cancel()
+            }
+        case let .ended(axis):
+            if axis == .horizontal, case let .seek(target, _) = hud {
+                seek(to: target)
+            }
+            if let hud { flash(hud, duration: 0.4) }
+        }
+    }
+
+    func handleLongPress(began: Bool) {
+        guard !isLocked else { return }
+        if began {
+            rateBeforeLongPress = rate
+            player.rate = Float(settings.longPressRate)
+            hud = .rate(settings.longPressRate)
+            hudTask?.cancel()
+        } else if let previous = rateBeforeLongPress {
+            player.rate = Float(previous)
+            rateBeforeLongPress = nil
+            withAnimation { hud = nil }
+        }
+    }
+
+    func handlePinch(scale: CGFloat) {
+        guard !isLocked else { return }
+        if scale > 1.1, !isFill { toggleFill() }
+        if scale < 0.9, isFill { toggleFill() }
+    }
     #endif
+
+    #if os(iOS)
+    private typealias PlayerHostView = UIView
+    #else
+    private typealias PlayerHostView = NSView
+    #endif
+
+    private static func playerLayer(in view: PlayerHostView) -> AVPlayerLayer? {
+        if let found = playerLayer(from: view.layer) { return found }
+        for subview in view.subviews {
+            if let found = playerLayer(in: subview) { return found }
+        }
+        return nil
+    }
+
+    private static func playerLayer(from layer: CALayer?) -> AVPlayerLayer? {
+        guard let layer else { return nil }
+        if let player = layer as? AVPlayerLayer { return player }
+        for sub in layer.sublayers ?? [] {
+            if let found = playerLayer(from: sub) { return found }
+        }
+        return nil
+    }
 
     private func removeObservers() {
         if let timeObserver { player.removeTimeObserver(timeObserver) }
@@ -334,6 +755,7 @@ final class NativePlayerController: NSObject {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
         statusObservation = nil
+        timeControlObservation = nil
     }
 
     #if os(iOS)
@@ -411,11 +833,11 @@ final class NativePlayerController: NSObject {
 #if os(iOS)
 extension NativePlayerController: AVPlayerViewControllerDelegate {
     func playerViewControllerDidStartPictureInPicture(_: AVPlayerViewController) {
-        isPiPActive = true
+        isPictureInPicture = true
     }
 
     func playerViewControllerDidStopPictureInPicture(_: AVPlayerViewController) {
-        isPiPActive = false
+        isPictureInPicture = false
         if viewController.presentingViewController == nil {
             finish()
         }
@@ -449,14 +871,15 @@ extension UIApplication {
         return controller
     }
 }
+
 #else
 extension NativePlayerController: AVPlayerViewPictureInPictureDelegate {
     func playerViewWillStartPicture(inPicture _: AVPlayerView) {
-        isPiPActive = true
+        isPictureInPicture = true
     }
 
     func playerViewDidStopPicture(inPicture _: AVPlayerView) {
-        isPiPActive = false
+        isPictureInPicture = false
     }
 
     func playerView(_: AVPlayerView, restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
@@ -464,3 +887,37 @@ extension NativePlayerController: AVPlayerViewPictureInPictureDelegate {
     }
 }
 #endif
+
+extension NativePlayerController: PlayerSurface {}
+
+extension NativePlayerController: AVPictureInPictureControllerDelegate {
+    func pictureInPictureControllerDidStartPictureInPicture(_: AVPictureInPictureController) {
+        isPictureInPicture = true
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(_: AVPictureInPictureController) {
+        isPictureInPicture = false
+        #if os(iOS)
+        if viewController.presentingViewController == nil { finish() }
+        #endif
+    }
+
+    func pictureInPictureController(
+        _: AVPictureInPictureController,
+        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
+    ) {
+        #if os(iOS)
+        if viewController.presentingViewController != nil {
+            completionHandler(true)
+            return
+        }
+        guard let top = UIApplication.shared.topViewController else {
+            completionHandler(false)
+            return
+        }
+        top.present(viewController, animated: true) { completionHandler(true) }
+        #else
+        completionHandler(true)
+        #endif
+    }
+}

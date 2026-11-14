@@ -45,23 +45,25 @@ struct WelcomeView: View {
 struct AddServerView: View {
     private enum Route: Hashable {
         case discovered(DiscoveredServer)
-        case manualAccount
+        case manual(ServerKind)
         case plex
     }
 
     @Environment(\.dismiss) private var dismiss
-    @State private var browser = LocalServerBrowser()
+    @Environment(AppModel.self) private var app
 
     var body: some View {
         NavigationStack {
             List {
                 nearbySection
                 Section("手动添加") {
-                    NavigationLink(value: Route.manualAccount) {
-                        SourceRow(icon: TintedIcon(symbol: "server.rack", color: .indigo),
-                                  title: "Jellyfin · Emby · 飞牛影视", subtitle: "输入服务器地址和账号")
+                    ForEach([ServerKind.jellyfin, .emby, .fnos]) { kind in
+                        NavigationLink(value: Route.manual(kind)) {
+                            SourceRow(icon: ServerKindIcon(kind: kind), title: kind.displayName,
+                                      subtitle: "输入地址和账号，端口 \(kind.defaultPort)")
+                        }
+                        .accessibilityIdentifier("manual-\(kind.rawValue)")
                     }
-                    .accessibilityIdentifier("manual-account")
                     NavigationLink(value: Route.plex) {
                         SourceRow(icon: ServerKindIcon(kind: .plex), title: "Plex", subtitle: "使用 Plex 账号登录，或填写地址与 Token")
                     }
@@ -80,33 +82,33 @@ struct AddServerView: View {
                 case let .discovered(server) where server.kind == .plex:
                     PlexLoginView(discovered: server) { dismiss() }
                 case let .discovered(server):
-                    AccountLoginView(discovered: server) { dismiss() }
-                case .manualAccount:
-                    AccountLoginView(discovered: nil) { dismiss() }
+                    AccountLoginView(discovered: server, expected: server.kind) { dismiss() }
+                case let .manual(kind):
+                    AccountLoginView(discovered: nil, expected: kind) { dismiss() }
                 case .plex:
                     PlexLoginView(discovered: nil) { dismiss() }
                 }
             }
-            .animation(.snappy, value: browser.servers)
-            .animation(.snappy, value: browser.isSearching)
         }
         #if os(macOS)
         .frame(minWidth: 520, idealWidth: 560, minHeight: 560, idealHeight: 620)
         #endif
-        .task { browser.start() }
-        .onDisappear { browser.stop() }
+        .task { app.browser.start() }
     }
 
     private var nearbySection: some View {
         Section {
-            ForEach(browser.servers) { server in
+            ForEach(app.browser.servers) { server in
                 NavigationLink(value: Route.discovered(server)) {
                     SourceRow(icon: ServerKindIcon(kind: server.kind), title: server.name,
-                              subtitle: "\(server.kind.displayName) · \(server.address)")
+                              subtitle: server.address.isEmpty
+                                  ? "\(server.kind.displayName) · 正在获取地址…"
+                                  : "\(server.kind.displayName) · \(server.address)")
                 }
+                .disabled(server.address.isEmpty)
             }
-            if browser.servers.isEmpty {
-                if browser.isSearching {
+            if app.browser.servers.isEmpty {
+                if app.browser.isSearching {
                     HStack(spacing: 10) {
                         ProgressView()
                         Text("正在搜索局域网…").foregroundStyle(.secondary)
@@ -115,7 +117,7 @@ struct AddServerView: View {
                     HStack {
                         Text("没有发现服务器").foregroundStyle(.secondary)
                         Spacer()
-                        Button("重新搜索") { browser.restart() }
+                        Button("重新搜索") { app.browser.restart() }
                             .buttonStyle(.borderless)
                     }
                 }
@@ -123,7 +125,7 @@ struct AddServerView: View {
         } header: {
             Text("附近的服务器")
         } footer: {
-            Text("可自动发现局域网中的飞牛影视与 Plex，选择后只需登录账号。Jellyfin 与 Emby 请手动添加。")
+            Text("可自动发现局域网中的 Jellyfin、Emby、飞牛影视与 Plex，选择后只需登录账号。")
         }
     }
 }
@@ -132,27 +134,38 @@ struct AddServerView: View {
 
 private struct AccountLoginView: View {
     private enum Field: Hashable {
-        case address, username, password
-    }
-
-    private enum ProbeState: Equatable {
-        case idle
-        case probing
-        case found(url: URL, kind: ServerKind, name: String, version: String?)
-        case failed(String)
+        case username, password
     }
 
     /// 为 nil 时为手动添加，需要填写地址
     let discovered: DiscoveredServer?
+    /// 用户选择的服务器类型。手动添加时只连接这一类，不再把三种服务当成同一个入口。
+    let expected: ServerKind
     let close: () -> Void
+
+    init(discovered: DiscoveredServer?, expected: ServerKind, close: @escaping () -> Void) {
+        self.discovered = discovered
+        self.expected = expected
+        self.close = close
+        if discovered == nil {
+            _port = State(initialValue: String(expected.defaultPort))
+        }
+    }
 
     @Environment(AppModel.self) private var app
     @FocusState private var focus: Field?
 
-    @State private var address = ""
+    @State private var name = ""
+    @State private var note = ""
+    @State private var host = ""
+    @State private var path = ""
+    @State private var port = ""
+    @State private var useHTTPS = false
     @State private var username = ""
     @State private var password = ""
-    @State private var probe = ProbeState.idle
+    @State private var backupLines: [ServerLine] = []
+    @State private var timeout = 20.0
+    @State private var allowsInsecureTLS = false
     @State private var isWorking = false
     @State private var errorText: String?
 
@@ -161,168 +174,191 @@ private struct AccountLoginView: View {
             if let discovered {
                 ServerHeader(kind: discovered.kind, name: discovered.name, detail: discovered.address)
             } else {
-                addressSection
+                Section {
+                    TextField("名称", text: $name, prompt: Text("可选"))
+                        .plainTextEntry()
+                    TextField("备注", text: $note, prompt: Text("可选"))
+                        .plainTextEntry()
+                }
+                Section("服务器地址") {
+                    ServerAddressFields(host: $host, path: $path, port: $port, useHTTPS: $useHTTPS, onEdit: clearError, onSubmitHost: { focus = .username }, focusOnAppear: true)
+                }
             }
 
-            Section("账号") {
-                TextField("用户名", text: $username)
-                    .accessibilityIdentifier("username")
-                    .textContentType(.username)
-                    .plainTextEntry()
-                    .focused($focus, equals: .username)
-                    .submitLabel(.next)
-                    .onSubmit { focus = .password }
-                PasswordField(title: "密码", text: $password, identifier: "password",
-                              isFocused: Binding(get: { focus == .password },
-                                                 set: { focus = $0 ? .password : (focus == .password ? nil : focus) })) {
-                    if canConnect { connect() }
+            loginSection
+
+            if discovered == nil {
+                Section {
+                    NavigationLink {
+                        BackupLinesEditor(lines: $backupLines)
+                    } label: {
+                        LabeledContent("备用线路", value: "\(backupLines.count)")
+                    }
+                    NavigationLink {
+                        ServerAdvancedSettings(timeout: $timeout, allowsInsecureTLS: $allowsInsecureTLS)
+                    } label: {
+                        Text("高级设置")
+                    }
                 }
-                .focused($focus, equals: .password)
-                .submitLabel(.go)
             }
 
             if let errorText {
                 Section {
                     Label(errorText, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
                         .foregroundStyle(.red)
                 }
             }
 
-            Section {
-                ConnectButton(isWorking: isWorking, action: connect)
-                    .disabled(!canConnect)
+            if discovered != nil {
+                Section {
+                    ConnectButton(isWorking: isWorking, action: connect)
+                        .disabled(!canConnect)
+                }
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets())
             }
-            .listRowBackground(Color.clear)
-            .listRowInsets(EdgeInsets())
         }
         .formStyle(.grouped)
-        .navigationTitle(discovered == nil ? "手动添加" : "登录")
+        .navigationTitle(discovered == nil ? expected.displayName : "登录")
         .inlineNavigationTitle()
         .disabled(isWorking)
-        .animation(.snappy, value: probe)
         .animation(.snappy, value: errorText)
-        .task(id: address) { await detectServer() }
         .task {
+            guard discovered != nil else { return }
             try? await Task.sleep(for: .milliseconds(450))
-            focus = discovered == nil ? .address : .username
+            focus = .username
         }
-    }
-
-    private var addressSection: some View {
-        Section {
-            TextField("服务器地址", text: $address, prompt: Text("192.168.1.10:8096"))
-                .accessibilityIdentifier("server-address")
-                .urlKeyboard()
-                .textContentType(.URL)
-                .plainTextEntry()
-                .focused($focus, equals: .address)
-                .submitLabel(.next)
-                .onSubmit { focus = .username }
-            probeRow
-        } header: {
-            Text("地址")
-        } footer: {
-            Text("会自动识别服务器类型；不写端口时依次尝试 8096（Jellyfin / Emby）和 8005（飞牛影视）。不写协议时使用 http。")
-        }
-    }
-
-    @ViewBuilder
-    private var probeRow: some View {
-        switch probe {
-        case .idle:
-            EmptyView()
-        case .probing:
-            HStack(spacing: 10) {
-                ProgressView().controlSize(.small)
-                Text("正在识别服务器…").font(.subheadline).foregroundStyle(.secondary)
-            }
-        case let .found(url, kind, name, version):
-            HStack(spacing: 12) {
-                ServerKindIcon(kind: kind)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(name).font(.subheadline.weight(.semibold))
-                    Text([kind.displayName, version, url.hostWithPort].compactMap(\.self).joined(separator: " · "))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+        #if os(iOS)
+        .toolbar {
+            if discovered == nil {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("连接") { connect() }
+                        .disabled(!canConnect)
                 }
-                Spacer()
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
             }
-        case let .failed(message):
-            Label(message, systemImage: "exclamationmark.circle")
-                .font(.footnote)
-                .foregroundStyle(.orange)
+        }
+        #else
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if discovered == nil {
+                HStack {
+                    Spacer()
+                    Button("连接") { connect() }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!canConnect)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+            }
+        }
+        #endif
+    }
+
+    private var loginSection: some View {
+        Section("登录信息") {
+            TextField("用户", text: $username, prompt: Text(discovered == nil ? "必填" : "用户名"))
+                .accessibilityIdentifier("username")
+                .textContentType(.username)
+                .plainTextEntry()
+                .focused($focus, equals: .username)
+                .submitLabel(.next)
+                .onSubmit { focus = .password }
+            PasswordField(title: "密码", text: $password, identifier: "password",
+                          prompt: discovered == nil ? "可选" : nil, canReveal: true,
+                          isFocused: Binding(get: { focus == .password },
+                                             set: { focus = $0 ? .password : (focus == .password ? nil : focus) })) {
+                if canConnect { connect() }
+            }
+            .focused($focus, equals: .password)
+            .submitLabel(.go)
         }
     }
 
     private var canConnect: Bool {
-        (discovered != nil || !address.isEmpty) && !username.isEmpty && !isWorking
+        if isWorking { return false }
+        if discovered != nil { return !username.isEmpty }
+        return !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !username.isEmpty
     }
 
-    /// 停止输入片刻后探测地址，未写端口时补全常见端口
-    private func detectServer() async {
-        probe = .idle
-        guard discovered == nil, let base = address.normalizedServerURL, base.host() != nil else { return }
-        try? await Task.sleep(for: .milliseconds(500))
-        guard !Task.isCancelled else { return }
-        probe = .probing
-        for candidate in Self.candidates(for: base) {
-            let result = try? await JellyfinClient.probe(baseURL: candidate, timeout: 4)
-            guard !Task.isCancelled else { return }
-            if let (kind, info) = result {
-                probe = .found(url: candidate, kind: kind, name: info.serverName ?? kind.displayName, version: info.version)
-                return
-            }
-        }
-        probe = .failed("未识别到 Jellyfin、Emby 或飞牛影视，请检查地址和端口")
-    }
-
-    private static func candidates(for url: URL) -> [URL] {
-        guard url.port == nil, url.path().isEmpty || url.path() == "/",
-              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return [url] }
-        return [url] + [8096, 8005].compactMap { port in
-            components.port = port
-            return components.url
-        }
+    private func clearError() {
+        errorText = nil
     }
 
     private func connect() {
-        let typed = discovered.flatMap { URL(string: "http://\($0.address)") } ?? address.normalizedServerURL
-        guard let typed else {
-            errorText = APIError.invalidURL.localizedDescription
-            return
-        }
         focus = nil
+        let typed: URL
+        if let discovered {
+            guard let url = URL(string: "http://\(discovered.address)") else {
+                errorText = APIError.invalidURL.localizedDescription
+                return
+            }
+            typed = url
+        } else {
+            ServerAddress.absorb(host: &host, path: &path, port: &port, https: &useHTTPS)
+            let portText = port.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !portText.isEmpty, Int(portText).map({ (1 ... 65535).contains($0) }) != true {
+                errorText = "端口应为 1 到 65535 的数字"
+                return
+            }
+            guard let url = ServerAddress.compose(host: host, path: path, port: port, https: useHTTPS) else {
+                errorText = host.contains("/") ? "路径请写在下面的路径一栏" : "请填写主机"
+                return
+            }
+            typed = url
+        }
         isWorking = true
         errorText = nil
+        let alternates = port.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !useHTTPS ? [expected.defaultPort] : []
+        let enteredName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let enteredNote = note.trimmingCharacters(in: .whitespacesAndNewlines)
         Task {
             defer { isWorking = false }
             do {
-                var url = typed
+                let url: URL
                 let kind: ServerKind
                 if let discovered {
+                    url = typed
                     kind = discovered.kind
-                } else if case let .found(foundURL, foundKind, _, _) = probe {
-                    url = foundURL
-                    kind = foundKind
                 } else {
-                    kind = try await JellyfinClient.probe(baseURL: typed).0
+                    url = try await locate(typed, alternates: alternates)
+                    kind = expected
                 }
-                let result = try await JellyfinClient.authenticate(baseURL: url, kind: kind, username: username, password: password)
-                // 已添加过的账号视为重新登录：更新令牌并切换过去
+                let result = try await JellyfinClient.authenticate(
+                    baseURL: url, kind: kind, username: username, password: password,
+                    allowsInsecureTLS: allowsInsecureTLS, timeout: timeout
+                )
                 if let existing = app.accounts.first(where: { $0.baseURL == url && $0.userID == result.userID }) {
                     app.add(existing, token: result.token)
                     close()
                     return
                 }
-                let account = ServerAccount(id: UUID(), kind: kind, name: result.serverName, baseURL: url,
-                                            userID: result.userID, username: result.username)
+                let account = ServerAccount(
+                    id: UUID(), kind: kind, name: enteredName.isEmpty ? result.serverName : enteredName, baseURL: url,
+                    userID: result.userID, username: result.username, note: enteredNote, backupLines: backupLines,
+                    advanced: ServerAdvanced(timeout: timeout, allowsInsecureTLS: allowsInsecureTLS)
+                )
                 app.add(account, token: result.token)
                 close()
             } catch {
                 errorText = friendlyMessage(for: error)
             }
         }
+    }
+
+    /// 只接受用户选中的那一种服务器。地址属于另一种时，提示改走对应入口。
+    private func locate(_ url: URL, alternates: [Int]) async throws -> URL {
+        let targets = await ServerEndpoint.candidates(for: url, alternatePorts: alternates)
+        let timeout = max(timeout, 4)
+        for candidate in targets {
+            if let (kind, _) = try? await JellyfinClient.probe(baseURL: candidate, timeout: timeout, allowsInsecureTLS: allowsInsecureTLS) {
+                guard kind == expected else {
+                    throw APIError.message("这是\(kind.displayName)，请从\(kind.displayName)入口添加")
+                }
+                return candidate
+            }
+        }
+        throw APIError.message("没有连上\(expected.displayName)，请检查地址和端口")
     }
 }
 
@@ -332,14 +368,31 @@ private struct PlexLoginView: View {
     let discovered: DiscoveredServer?
     let close: () -> Void
 
+    init(discovered: DiscoveredServer?, close: @escaping () -> Void) {
+        self.discovered = discovered
+        self.close = close
+        if discovered == nil {
+            _port = State(initialValue: String(ServerKind.plex.defaultPort))
+        }
+    }
+
     @Environment(AppModel.self) private var app
     @Environment(\.webAuthenticationSession) private var webAuthenticationSession
 
     @State private var plexToken: String?
     @State private var plexUsername = ""
     @State private var plexServers: [PlexClient.Resource] = []
-    @State private var manualURL = ""
+    @State private var name = ""
+    @State private var note = ""
+    @State private var host = ""
+    @State private var path = ""
+    @State private var port = ""
+    @State private var useHTTPS = false
+    @State private var manualUser = ""
     @State private var manualToken = ""
+    @State private var backupLines: [ServerLine] = []
+    @State private var timeout = 20.0
+    @State private var allowsInsecureTLS = false
     @State private var isWorking = false
     @State private var errorText: String?
 
@@ -359,17 +412,38 @@ private struct PlexLoginView: View {
                 } footer: {
                     Text("将在系统安全浏览器中打开 plex.tv 完成登录，Origin 不会接触你的密码。")
                 }
-                Section {
-                    if discovered == nil {
-                        TextField("服务器地址", text: $manualURL, prompt: Text("http://192.168.1.10:32400"))
-                            .urlKeyboard()
+                if discovered == nil {
+                    Section {
+                        TextField("名称", text: $name, prompt: Text("可选"))
+                            .plainTextEntry()
+                        TextField("备注", text: $note, prompt: Text("可选"))
                             .plainTextEntry()
                     }
-                    PasswordField(title: "X-Plex-Token", text: $manualToken)
-                    Button("使用 Token 连接") { connectManual() }
-                        .disabled((discovered == nil && manualURL.isEmpty) || manualToken.isEmpty)
-                } header: {
-                    Text("使用 Token")
+                    Section("服务器地址") {
+                        ServerAddressFields(host: $host, path: $path, port: $port, useHTTPS: $useHTTPS, onEdit: { errorText = nil }, focusOnAppear: true)
+                    }
+                }
+                Section("登录信息") {
+                    if discovered == nil {
+                        TextField("用户", text: $manualUser, prompt: Text("可选"))
+                            .textContentType(.username)
+                            .plainTextEntry()
+                    }
+                    PasswordField(title: "Token", text: $manualToken, prompt: "必填", canReveal: true)
+                }
+                if discovered == nil {
+                    Section {
+                        NavigationLink {
+                            BackupLinesEditor(lines: $backupLines)
+                        } label: {
+                            LabeledContent("备用线路", value: "\(backupLines.count)")
+                        }
+                        NavigationLink {
+                            ServerAdvancedSettings(timeout: $timeout, allowsInsecureTLS: $allowsInsecureTLS)
+                        } label: {
+                            Text("高级设置")
+                        }
+                    }
                 }
             } else {
                 Section {
@@ -408,9 +482,36 @@ private struct PlexLoginView: View {
         .overlay {
             if isWorking { ProgressView().controlSize(.large) }
         }
-        .onAppear {
-            if let discovered, manualURL.isEmpty { manualURL = "http://\(discovered.address)" }
+        #if os(iOS)
+        .toolbar {
+            if plexToken == nil {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("连接") { connectManual() }
+                        .disabled(!canConnectManually)
+                }
+            }
         }
+        #else
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if plexToken == nil {
+                HStack {
+                    Spacer()
+                    Button("连接") { connectManual() }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!canConnectManually)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+            }
+        }
+        #endif
+    }
+
+    private var canConnectManually: Bool {
+        if isWorking || manualToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        if discovered != nil { return true }
+        return !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func signIn() {
@@ -459,25 +560,61 @@ private struct PlexLoginView: View {
     }
 
     private func connectManual() {
-        guard let url = manualURL.normalizedServerURL else {
-            errorText = APIError.invalidURL.localizedDescription
-            return
+        let typed: URL
+        if let discovered {
+            guard let url = URL(string: "http://\(discovered.address)") else {
+                errorText = APIError.invalidURL.localizedDescription
+                return
+            }
+            typed = url
+        } else {
+            ServerAddress.absorb(host: &host, path: &path, port: &port, https: &useHTTPS)
+            let portText = port.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !portText.isEmpty, Int(portText).map({ (1 ... 65535).contains($0) }) != true {
+                errorText = "端口应为 1 到 65535 的数字"
+                return
+            }
+            guard let url = ServerAddress.compose(host: host, path: path, port: port, https: useHTTPS) else {
+                errorText = host.contains("/") ? "路径请写在下面的路径一栏" : "请填写主机"
+                return
+            }
+            typed = url
         }
+        let token = manualToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
         isWorking = true
         errorText = nil
+        let enteredName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let enteredNote = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        let alternates = port.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !useHTTPS ? [ServerKind.plex.defaultPort] : []
         Task {
             defer { isWorking = false }
             var headers = PlexClient.clientHeaders
-            headers["X-Plex-Token"] = manualToken
-            do {
-                _ = try await HTTPClient(timeout: 10).data(url.appending(path: "/library/sections", query: [:]), headers: headers)
-                let account = ServerAccount(id: UUID(), kind: .plex, name: discovered?.name ?? url.host() ?? "Plex",
-                                            baseURL: url, userID: "local", username: "Plex")
-                app.add(account, token: manualToken)
-                close()
-            } catch {
-                errorText = friendlyMessage(for: error)
+            headers["X-Plex-Token"] = token
+            let targets = await ServerEndpoint.candidates(for: typed, alternatePorts: alternates)
+            var lastError: Error?
+            for target in targets {
+                do {
+                    _ = try await HTTPClient(timeout: timeout, allowsInsecureTLS: allowsInsecureTLS)
+                        .data(target.appending(path: "/library/sections", query: [:]), headers: headers)
+                    let fallback = discovered?.name ?? target.host() ?? "Plex"
+                    let user = manualUser.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let account = ServerAccount(
+                        id: UUID(), kind: .plex, name: enteredName.isEmpty ? fallback : enteredName, baseURL: target,
+                        userID: "local", username: user.isEmpty ? "Plex" : user, note: enteredNote, backupLines: backupLines,
+                        advanced: ServerAdvanced(timeout: timeout, allowsInsecureTLS: allowsInsecureTLS)
+                    )
+                    app.add(account, token: token)
+                    close()
+                    return
+                } catch let error where ServerEndpoint.isUnreachable(error) {
+                    lastError = error
+                } catch {
+                    errorText = friendlyMessage(for: error)
+                    return
+                }
             }
+            errorText = friendlyMessage(for: lastError ?? APIError.message("无法连接到服务器，请检查地址和端口"))
         }
     }
 }
@@ -676,6 +813,7 @@ extension ServerKind {
 extension URL {
     var hostWithPort: String? {
         guard let host = host() else { return nil }
-        return port.map { "\(host):\($0)" } ?? host
+        let literal = host.contains(":") ? "[\(host)]" : host
+        return port.map { "\(literal):\($0)" } ?? literal
     }
 }

@@ -100,7 +100,7 @@ final class ControlHandler {
         switch item {
         case .home, nil: "home"
         case .search: "search"
-        case .downloads: "downloads"
+        case .servers: "servers"
         case .favorites: "favorites"
         case let .library(library): "library:\(library.id) \(library.name)"
         }
@@ -204,14 +204,7 @@ final class ControlHandler {
             return .error("需要 address 与 username（password 可选）")
         }
         var found: (URL, ServerKind)?
-        var candidates = [address]
-        if address.port == nil, var components = URLComponents(url: address, resolvingAgainstBaseURL: false) {
-            for port in [8096, 8005] {
-                components.port = port
-                if let url = components.url { candidates.append(url) }
-            }
-        }
-        for candidate in candidates {
+        for candidate in await ServerEndpoint.candidates(for: address) {
             if let (kind, _) = try? await JellyfinClient.probe(baseURL: candidate, timeout: 6) {
                 found = (candidate, kind)
                 break
@@ -221,11 +214,11 @@ final class ControlHandler {
         let result = try await JellyfinClient.authenticate(baseURL: url, kind: kind, username: username, password: request.string("password") ?? "")
         if let existing = app.accounts.first(where: { $0.baseURL == url && $0.userID == result.userID }) {
             app.add(existing, token: result.token)
-            return .json(["ok": true, "account": existing.id.uuidString, "note": "账号已存在，已更新令牌并切换"])
+            return .json(["ok": true, "account": existing.id.uuidString, "url": url.absoluteString, "note": "账号已存在，已更新令牌并切换"])
         }
         let account = ServerAccount(id: UUID(), kind: kind, name: result.serverName, baseURL: url, userID: result.userID, username: result.username)
         app.add(account, token: result.token)
-        return .json(["ok": true, "account": account.id.uuidString, "kind": kind.rawValue, "server": result.serverName])
+        return .json(["ok": true, "account": account.id.uuidString, "kind": kind.rawValue, "server": result.serverName, "url": url.absoluteString])
     }
 
     private func selectServer(_ request: ControlRequest) -> ControlResponse {
@@ -244,11 +237,11 @@ final class ControlHandler {
         switch target {
         case "home": navigation.selection = .home
         case "search": navigation.selection = .search
-        case "downloads": navigation.selection = .downloads
+        case "downloads":
+            navigation.trail.append("下载")
+            navigation.path.append(Route.downloads)
         case "favorites": navigation.selection = .favorites
-        case "servers":
-            navigation.trail.append("服务器管理")
-            navigation.path.append(Route.servers)
+        case "servers": navigation.selection = .servers
         case "library":
             let key = request.string("id") ?? request.string("name") ?? ""
             guard let library = navigation.libraries.first(where: { $0.id == key || $0.name == key }) else {

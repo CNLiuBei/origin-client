@@ -27,8 +27,8 @@ final class DemoServerFlowTests: XCTestCase {
         if addButton.waitForExistence(timeout: 5) {
             snapshot("01-welcome")
             addButton.tap()
-            app.buttons["manual-account"].tap()
-            let address = app.textFields["server-address"]
+            app.buttons["manual-jellyfin"].tap()
+            let address = app.textFields["server-host"]
             XCTAssertTrue(address.waitForExistence(timeout: 5))
             address.tap()
             address.typeText("https://demo.jellyfin.org/stable")

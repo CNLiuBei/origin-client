@@ -37,6 +37,23 @@ enum PlayerEngine: String, CaseIterable, Identifiable {
     }
 }
 
+/// 遇到服务器标记的片头或片尾时怎么处理
+enum SegmentSkip: String, CaseIterable, Identifiable {
+    case ask
+    case automatic
+    case off
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .ask: "询问"
+        case .automatic: "自动跳过"
+        case .off: "关闭"
+        }
+    }
+}
+
 enum LanguagePreference: String, CaseIterable, Identifiable {
     case auto
     case chinese
@@ -84,6 +101,8 @@ final class AppSettings {
         "skipBackward": 10,
         "autoPlayNext": true,
         "autoResume": true,
+        "skipIntro": SegmentSkip.ask.rawValue,
+        "skipCredits": SegmentSkip.ask.rawValue,
         "audioLanguage": LanguagePreference.auto.rawValue,
         "subtitleLanguage": LanguagePreference.chinese.rawValue,
         "subtitleSize": 22.0,
@@ -105,6 +124,8 @@ final class AppSettings {
     var skipBackward: Int { didSet { save("skipBackward", skipBackward) } }
     var autoPlayNext: Bool { didSet { save("autoPlayNext", autoPlayNext) } }
     var autoResume: Bool { didSet { save("autoResume", autoResume) } }
+    var skipIntro: SegmentSkip { didSet { save("skipIntro", skipIntro.rawValue) } }
+    var skipCredits: SegmentSkip { didSet { save("skipCredits", skipCredits.rawValue) } }
     var audioLanguage: LanguagePreference { didSet { save("audioLanguage", audioLanguage.rawValue) } }
     var subtitleLanguage: LanguagePreference { didSet { save("subtitleLanguage", subtitleLanguage.rawValue) } }
     var subtitleSize: Double { didSet { save("subtitleSize", subtitleSize) } }
@@ -126,6 +147,8 @@ final class AppSettings {
         skipBackward = defaults.integer(forKey: "skipBackward")
         autoPlayNext = defaults.bool(forKey: "autoPlayNext")
         autoResume = defaults.bool(forKey: "autoResume")
+        skipIntro = SegmentSkip(rawValue: defaults.string(forKey: "skipIntro") ?? "") ?? .ask
+        skipCredits = SegmentSkip(rawValue: defaults.string(forKey: "skipCredits") ?? "") ?? .ask
         audioLanguage = LanguagePreference(rawValue: defaults.string(forKey: "audioLanguage") ?? "") ?? .auto
         subtitleLanguage = LanguagePreference(rawValue: defaults.string(forKey: "subtitleLanguage") ?? "") ?? .chinese
         subtitleSize = defaults.double(forKey: "subtitleSize")
@@ -146,6 +169,8 @@ final class AppSettings {
             "skipBackward": skipBackward,
             "autoPlayNext": autoPlayNext,
             "autoResume": autoResume,
+            "skipIntro": skipIntro.rawValue,
+            "skipCredits": skipCredits.rawValue,
             "audioLanguage": audioLanguage.rawValue,
             "subtitleLanguage": subtitleLanguage.rawValue,
             "subtitleSize": subtitleSize,
@@ -185,6 +210,10 @@ final class AppSettings {
             applied = apply(Self.bool(value), into: \.autoPlayNext)
         case "autoResume":
             applied = apply(Self.bool(value), into: \.autoResume)
+        case "skipIntro":
+            applied = apply(value as? String, into: \.skipIntro, as: SegmentSkip.self)
+        case "skipCredits":
+            applied = apply(value as? String, into: \.skipCredits, as: SegmentSkip.self)
         case "audioLanguage":
             guard let raw = value as? String, let parsed = LanguagePreference(rawValue: raw), parsed != .none else { return }
             audioLanguage = parsed

@@ -117,3 +117,34 @@ extension View {
         #endif
     }
 }
+
+/// 优先打开已安装的 App。没有对应 App 时再打开网页。
+enum AppLink {
+    static func open(appScheme: URL?, web: URL) {
+        #if os(iOS)
+        if let appScheme {
+            UIApplication.shared.open(appScheme) { accepted in
+                guard !accepted else { return }
+                Task { @MainActor in
+                    UIApplication.shared.open(web)
+                }
+            }
+        } else {
+            UIApplication.shared.open(web, options: [.universalLinksOnly: true]) { accepted in
+                guard !accepted else { return }
+                Task { @MainActor in
+                    UIApplication.shared.open(web)
+                }
+            }
+        }
+        #else
+        let first = appScheme ?? web
+        NSWorkspace.shared.open(first, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+            guard error != nil, first != web else { return }
+            Task { @MainActor in
+                NSWorkspace.shared.open(web)
+            }
+        }
+        #endif
+    }
+}

@@ -3,7 +3,9 @@ import SwiftUI
 struct SettingsView: View {
     var body: some View {
         Form {
+            #if os(macOS)
             ServerSettingsSection()
+            #endif
             SyncSettingsSection()
             EngineSettingsSection()
             PlaybackSettingsSection()
@@ -15,6 +17,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("设置")
+        .inlineNavigationTitle()
     }
 }
 
@@ -24,16 +27,16 @@ private struct SyncSettingsSection: View {
     @Environment(AppModel.self) private var app
 
     var body: some View {
-        Section {
+        Section("同步") {
             NavigationLink {
                 ServerSyncView()
             } label: {
-                HStack {
-                    Text("iCloud 同步")
-                    Spacer()
-                    SyncDeviceIcons()
-                    Text(app.cloudSync.statusTitle)
-                        .foregroundStyle(.secondary)
+                LabeledContent("iCloud 同步") {
+                    HStack(spacing: 6) {
+                        SyncDeviceIcons()
+                        Text(app.cloudSync.statusTitle)
+                    }
+                    .foregroundStyle(.secondary)
                 }
             }
         }
@@ -42,6 +45,7 @@ private struct SyncSettingsSection: View {
 
 // MARK: - 服务器
 
+#if os(macOS)
 private struct ServerSettingsSection: View {
     @Environment(AppModel.self) private var app
 
@@ -76,6 +80,7 @@ private struct ServerSettingsSection: View {
         return parts.joined(separator: " · ")
     }
 }
+#endif
 
 // MARK: - 播放
 
@@ -96,7 +101,6 @@ private struct EngineSettingsSection: View {
             .labelsHidden()
             .frame(maxWidth: .infinity)
             .accessibilityLabel("播放内核")
-            .padding(.vertical, 2)
         } header: {
             Text("播放内核")
         } footer: {
@@ -110,30 +114,46 @@ private struct PlaybackSettingsSection: View {
 
     var body: some View {
         @Bindable var settings = app.settings
-        Section("播放") {
+        Section {
             Toggle("硬件解码", isOn: $settings.hardwareDecode)
             Toggle("自动从上次位置继续", isOn: $settings.autoResume)
             Toggle("自动播放下一集", isOn: $settings.autoPlayNext)
+            Picker("片头", selection: $settings.skipIntro) {
+                ForEach(SegmentSkip.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.menu)
+            Picker("片尾", selection: $settings.skipCredits) {
+                ForEach(SegmentSkip.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.menu)
             Picker("默认倍速", selection: $settings.defaultRate) {
                 ForEach([0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
                     Text(rate.formatted() + "×").tag(rate)
                 }
             }
+            .pickerStyle(.menu)
             Picker("长按倍速", selection: $settings.longPressRate) {
                 ForEach([1.5, 2.0, 3.0], id: \.self) { rate in
                     Text(rate.formatted() + "×").tag(rate)
                 }
             }
+            .pickerStyle(.menu)
             Picker("快退", selection: $settings.skipBackward) {
                 ForEach([5, 10, 15, 30], id: \.self) { seconds in
                     Text("\(seconds) 秒").tag(seconds)
                 }
             }
+            .pickerStyle(.menu)
             Picker("快进", selection: $settings.skipForward) {
                 ForEach([10, 15, 30, 45, 60], id: \.self) { seconds in
                     Text("\(seconds) 秒").tag(seconds)
                 }
             }
+            .pickerStyle(.menu)
+        } header: {
+            Text("播放")
+        } footer: {
+            Text("有标记时，询问会显示跳过按钮，自动跳过会直接跳过。片头含前情和广告，片尾含预告。")
         }
     }
 }
@@ -149,11 +169,13 @@ private struct LanguageSettingsSection: View {
                     Text(language.title).tag(language)
                 }
             }
+            .pickerStyle(.menu)
             Picker("首选字幕", selection: $settings.subtitleLanguage) {
                 ForEach(LanguagePreference.allCases) { language in
                     Text(language.title).tag(language)
                 }
             }
+            .pickerStyle(.menu)
         }
     }
 }
@@ -176,38 +198,41 @@ private struct SubtitleStyleSection: View {
         } header: {
             Text("字幕样式")
         } footer: {
-            Text("应用于 FFmpeg 内核。系统播放器的字幕样式跟随“设置 › 辅助功能 › 字幕与隐藏式字幕”。")
+            Text("只影响 FFmpeg 内核。系统播放器沿用系统的字幕样式。")
         }
     }
 
     private func slider(_ title: String, value: Binding<Double>, range: ClosedRange<Double>, step: Double) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            LabeledContent(title) {
-                Text("\(Int(value.wrappedValue))")
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-                    .contentTransition(.numericText())
-            }
+        let number = Text(value.wrappedValue, format: .number.precision(.fractionLength(0)))
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+            .contentTransition(.numericText())
             .accessibilityHidden(true)
-            Slider(value: value, in: range, step: step)
-                .accessibilityLabel(title)
+        let control = Slider(value: value, in: range, step: step)
+            .accessibilityLabel(title)
+            .accessibilityValue(Text(value.wrappedValue, format: .number.precision(.fractionLength(0))))
+        return ViewThatFits(in: .horizontal) {
+            LabeledContent(title) {
+                HStack(spacing: 12) {
+                    control
+                    number.frame(minWidth: 32, alignment: .trailing)
+                }
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                LabeledContent { number } label: { Text(title) }
+                control
+            }
         }
     }
 }
 
 private struct SubtitlePreview: View {
     @Bindable var settings: AppSettings
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            LinearGradient(
-                colors: [
-                    Color(red: 0.23, green: 0.25, blue: 0.29),
-                    Color(red: 0.07, green: 0.08, blue: 0.10),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
+            LinearGradient(colors: [.black.opacity(0.72), .black], startPoint: .top, endPoint: .bottom)
             Text("字幕预览")
                 .font(.system(size: settings.subtitleSize, weight: .semibold))
                 .foregroundStyle(settings.subtitleColor)
@@ -230,8 +255,8 @@ private struct SubtitlePreview: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("字幕预览")
-        .animation(.snappy, value: settings.subtitleBackground)
-        .animation(.snappy, value: settings.subtitleColorHex)
+        .animation(reduceMotion ? nil : .snappy, value: settings.subtitleBackground)
+        .animation(reduceMotion ? nil : .snappy, value: settings.subtitleColorHex)
     }
 
     /// 预览比真实画面小，边距按比例压缩，滑杆仍能看出字幕在上下移动。
@@ -303,11 +328,14 @@ private struct SubtitleSwatchButton: View {
     let isSelected: Bool
     let action: () -> Void
 
+    @ScaledMetric(relativeTo: .body) private var diameter = 26
+    @ScaledMetric(relativeTo: .caption) private var mark = 11
+
     var body: some View {
         Button(action: action) {
             Circle()
                 .fill(Color(hex: swatch.hex))
-                .frame(width: 26, height: 26)
+                .frame(width: diameter, height: diameter)
                 .overlay {
                     Circle().strokeBorder(.primary.opacity(0.18), lineWidth: 1)
                 }
@@ -321,7 +349,7 @@ private struct SubtitleSwatchButton: View {
                 .overlay {
                     if isSelected {
                         Image(systemName: "checkmark")
-                            .font(.system(size: 11, weight: .bold))
+                            .font(.system(size: mark, weight: .bold))
                             .foregroundStyle(.black.opacity(0.72))
                     }
                 }
@@ -339,6 +367,7 @@ private struct SubtitleSwatchButton: View {
 
 private struct MetadataSettingsSection: View {
     @Environment(AppModel.self) private var app
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var status = TMDBStatus.idle
     @State private var checkID = 0
 
@@ -347,20 +376,15 @@ private struct MetadataSettingsSection: View {
         Section {
             Toggle("使用 TMDB 补充信息", isOn: $settings.tmdbEnabled)
             if settings.tmdbEnabled {
-                PasswordField(title: "Read Access Token", text: $settings.customTMDBToken) {
+                PasswordField(title: "访问令牌", text: $settings.customTMDBToken, prompt: "可选") {
                     app.refreshTMDB()
                 }
                 Button(action: test) {
-                    HStack(spacing: 8) {
-                        Text("测试连接")
-                        Spacer(minLength: 8)
-                        statusMark
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    LabeledContent("测试连接") { statusMark }
                 }
                 .disabled(status == .checking)
                 if status == .failed {
-                    Text("连接失败，请检查 Token 或网络")
+                    Text("连接失败，请检查令牌或网络")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -368,10 +392,10 @@ private struct MetadataSettingsSection: View {
         } header: {
             Text("元数据")
         } footer: {
-            Text("为影片补充 Logo、预告片、标语和演员头像。留空则使用内置 Token。")
+            Text("补充 Logo、预告片、标语和演员头像。令牌留空时使用内置的。")
         }
-        .animation(.snappy, value: settings.tmdbEnabled)
-        .animation(.snappy, value: status)
+        .animation(reduceMotion ? nil : .snappy, value: settings.tmdbEnabled)
+        .animation(reduceMotion ? nil : .snappy, value: status)
         .onChange(of: settings.tmdbEnabled) {
             app.refreshTMDB()
             invalidateCheck()
@@ -440,16 +464,19 @@ private struct StorageSettingsSection: View {
             }
             Button("清除图片缓存", role: .destructive) { confirmClear = true }
                 .disabled(cacheSize == 0)
-            LabeledContent("离线下载") {
-                Text(byteCount(app.downloads.totalSize))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+            NavigationLink(value: Route.downloads) {
+                LabeledContent("离线下载") {
+                    Text(byteCount(app.downloads.totalSize))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
             }
         }
         .onAppear { cacheSize = URLCache.shared.currentDiskUsage }
         .confirmationDialog("清除图片缓存？", isPresented: $confirmClear, titleVisibility: .visible) {
             Button("清除", role: .destructive) {
                 URLCache.shared.removeAllCachedResponses()
+                ImageLoader.clearMemory()
                 cacheSize = URLCache.shared.currentDiskUsage
             }
         } message: {
@@ -465,8 +492,14 @@ private struct StorageSettingsSection: View {
 // MARK: - 关于
 
 private struct AboutSettingsSection: View {
+    private static let github = URL(string: "https://github.com/CNLiuBei/origin-client")!
+    private static let telegramApp = URL(string: "tg://resolve?domain=NextOrigin")!
+    private static let telegram = URL(string: "https://t.me/NextOrigin")!
+    private static let qq = URL(string: "https://qm.qq.com/q/SwwYWu9FiA")!
     private static let ksplayer = URL(string: "https://github.com/kingslay/KSPlayer")!
     private static let tmdb = URL(string: "https://www.themoviedb.org")!
+    private static let telegramBlue = Color(red: 0x26 / 255, green: 0xA5 / 255, blue: 0xE4 / 255)
+    private static let qqBlue = Color(red: 0x1E / 255, green: 0xBA / 255, blue: 0xFC / 255)
 
     var body: some View {
         Section {
@@ -474,7 +507,7 @@ private struct AboutSettingsSection: View {
                 AppMark()
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Origin")
-                        .font(.body.weight(.semibold))
+                        .font(.headline)
                     Text("版本 \(DeviceInfo.version)")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
@@ -482,6 +515,10 @@ private struct AboutSettingsSection: View {
                 Spacer(minLength: 0)
             }
             .accessibilityElement(children: .combine)
+
+            communityLink("GitHub", asset: "BrandGitHub", tint: .primary, appScheme: nil, web: Self.github)
+            communityLink("Telegram", asset: "BrandTelegram", tint: Self.telegramBlue, appScheme: Self.telegramApp, web: Self.telegram)
+            communityLink("QQ群", asset: "BrandQQ", tint: Self.qqBlue, appScheme: nil, web: Self.qq)
 
             Link(destination: Self.ksplayer) {
                 LabeledContent("KSPlayer", value: "GPL-3.0")
@@ -494,5 +531,23 @@ private struct AboutSettingsSection: View {
         } footer: {
             Text("本产品使用 TMDB API，但未获得 TMDB 的认可或认证。播放内核使用 KSPlayer 与 FFmpeg（GPL-3.0）。")
         }
+    }
+
+    private func communityLink(_ title: String, asset: String, tint: Color, appScheme: URL?, web: URL) -> some View {
+        Button {
+            AppLink.open(appScheme: appScheme, web: web)
+        } label: {
+            Label {
+                Text(title)
+            } icon: {
+                Image(asset)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 22, height: 22)
+                    .foregroundStyle(tint)
+            }
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        }
+        .buttonStyle(.borderless)
     }
 }

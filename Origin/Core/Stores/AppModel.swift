@@ -6,6 +6,7 @@ final class AppModel {
     let settings = AppSettings()
     let cloudSync = CloudSync()
     let downloads = DownloadManager()
+    let browser = LocalServerBrowser()
     @ObservationIgnored lazy var player = PlayerPresenter(app: self)
 
     private(set) var accounts: [ServerAccount] = []
@@ -52,6 +53,8 @@ final class AppModel {
             ?? accounts.first?.id
         settings.cloudSync = cloudSync
         cloudSync.start(app: self)
+        // 启动时就开始找局域网服务器，打开添加页时列表已经在
+        browser.start()
     }
 
     func isLocked(_ account: ServerAccount) -> Bool {
@@ -98,21 +101,26 @@ final class AppModel {
         update(updated)
     }
 
-    func collectLibraries() async -> [MediaLibrary] {
+    func collectLibraries() async -> (libraries: [MediaLibrary], failure: String?) {
         let servers = homeAccounts
         let prefix = servers.count > 1
         var result: [MediaLibrary] = []
+        var failure: String?
         for account in servers {
             guard let client = client(for: account.id) else { continue }
-            let libraries = (try? await client.libraries()) ?? []
-            result.append(contentsOf: libraries.map { library in
-                var copy = library
-                copy.serverID = account.id
-                if prefix { copy.serverName = account.name }
-                return copy
-            })
+            do {
+                let libraries = try await client.libraries()
+                result.append(contentsOf: libraries.map { library in
+                    var copy = library
+                    copy.serverID = account.id
+                    if prefix { copy.serverName = account.name }
+                    return copy
+                })
+            } catch {
+                if failure == nil { failure = error.localizedDescription }
+            }
         }
-        return result
+        return (result, failure)
     }
 
     func client(for serverID: UUID) -> (any MediaServerClient)? {

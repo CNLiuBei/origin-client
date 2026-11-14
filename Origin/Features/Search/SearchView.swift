@@ -4,6 +4,7 @@ struct SearchView: View {
     @Environment(AppModel.self) private var app
     @State private var text = ""
     @State private var results: [MediaItem] = []
+    @State private var shownTerm = ""
     @State private var isSearching = false
     @AppStorage("recentSearches") private var recentData = Data()
 
@@ -26,19 +27,28 @@ struct SearchView: View {
         }
         .scrollIndicators(.hidden)
         .navigationTitle("搜索")
+        .inlineNavigationTitle()
         .searchable(text: $text, prompt: "电影、剧集、单集")
         .onSubmit(of: .search) { remember(text) }
         .task(id: text) {
             let term = text.trimmingCharacters(in: .whitespaces)
             guard !term.isEmpty else {
                 results = []
+                shownTerm = ""
+                isSearching = false
                 return
             }
-            try? await Task.sleep(for: .milliseconds(350))
-            let accounts = app.homeAccounts
-            guard !Task.isCancelled, !accounts.isEmpty else { return }
+            // 取消旧搜索时不要把 isSearching 改回 false，否则新搜索还在跑，界面会闪出上一批结果
             isSearching = true
-            defer { isSearching = false }
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            let accounts = app.homeAccounts
+            guard !accounts.isEmpty else {
+                results = []
+                shownTerm = term
+                isSearching = false
+                return
+            }
             var merged: [MediaItem] = []
             for account in accounts {
                 guard !Task.isCancelled else { return }
@@ -46,14 +56,17 @@ struct SearchView: View {
                     merged.append(contentsOf: found)
                 }
             }
+            guard !Task.isCancelled else { return }
             results = merged
+            shownTerm = term
+            isSearching = false
         }
     }
 
     @ViewBuilder
     private var recentList: some View {
         if recents.isEmpty {
-            ContentUnavailableView("搜索媒体库", systemImage: "magnifyingglass", description: Text("在当前服务器中搜索电影、剧集和单集"))
+            ContentUnavailableView("搜索媒体库", systemImage: "magnifyingglass", description: Text("搜索首页里的电影、剧集和单集"))
                 .padding(.top, 80)
         } else {
             VStack(alignment: .leading, spacing: 4) {
@@ -64,14 +77,27 @@ struct SearchView: View {
                 }
                 .padding(.bottom, 6)
                 ForEach(recents, id: \.self) { term in
-                    Button {
-                        text = term
-                    } label: {
-                        Label(term, systemImage: "clock.arrow.circlepath")
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 8)
+                    HStack(spacing: 8) {
+                        Button {
+                            text = term
+                        } label: {
+                            Label(term, systemImage: "clock.arrow.circlepath")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 8)
+                        }
+                        .tint(.primary)
+                        Button {
+                            forget(term)
+                        } label: {
+                            Image(systemName: "xmark")
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("删除“\(term)”")
                     }
-                    .tint(.primary)
+                    .contextMenu {
+                        Button("删除", systemImage: "trash", role: .destructive) { forget(term) }
+                    }
                     Divider()
                 }
             }
@@ -88,28 +114,45 @@ struct SearchView: View {
             ("单集", results.filter { $0.kind == .episode }),
         ].filter { !$0.1.isEmpty }
 
-        if groups.isEmpty, !isSearching {
+        let term = text.trimmingCharacters(in: .whitespaces)
+        if isSearching, shownTerm != term {
+            ProgressView("正在搜索…").padding(.top, 80)
+        } else if groups.isEmpty {
             ContentUnavailableView.search(text: text).padding(.top, 80)
         } else {
             LazyVStack(alignment: .leading, spacing: 24) {
+                Text("\(results.count) 个结果")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                 ForEach(groups, id: \.0) { title, items in
                     VStack(alignment: .leading, spacing: 10) {
                         Text(title).font(.title3.bold())
                         if title == "单集" {
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 14, alignment: .top)], spacing: 16) {
                                 ForEach(items) { item in
-                                    NavigationLink(value: item) { ThumbCard(item: item) }
-                                        .buttonStyle(.plain)
-                                        .simultaneousGesture(TapGesture().onEnded { remember(text) })
+                                    NavigationLink(value: item) {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            ThumbCard(item: item)
+                                            serverCaption(item)
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                    .contextMenu { ItemContextMenu(item: item) }
+                                    .simultaneousGesture(TapGesture().onEnded { remember(text) })
                                 }
                             }
                         } else {
                             LazyVGrid(columns: columns, spacing: 18) {
                                 ForEach(items) { item in
-                                    NavigationLink(value: item) { PosterCard(item: item) }
-                                        .buttonStyle(.plain)
-                                        .contextMenu { ItemContextMenu(item: item) }
-                                        .simultaneousGesture(TapGesture().onEnded { remember(text) })
+                                    NavigationLink(value: item) {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            PosterCard(item: item)
+                                            serverCaption(item)
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                    .contextMenu { ItemContextMenu(item: item) }
+                                    .simultaneousGesture(TapGesture().onEnded { remember(text) })
                                 }
                             }
                         }
@@ -118,6 +161,21 @@ struct SearchView: View {
             }
             .padding()
         }
+    }
+
+    @ViewBuilder
+    private func serverCaption(_ item: MediaItem) -> some View {
+        if app.homeAccounts.count > 1, let name = app.accounts.first(where: { $0.id == item.serverID })?.name {
+            Text(name)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private func forget(_ term: String) {
+        let list = recents.filter { $0 != term }
+        recentData = (try? JSONEncoder().encode(list)) ?? Data()
     }
 
     private func remember(_ term: String) {

@@ -1,10 +1,15 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#endif
 
 struct DownloadsView: View {
     @Environment(AppModel.self) private var app
+    @State private var confirmClear = false
 
     var body: some View {
         let downloads = app.downloads
+        let completed = downloads.records.filter { $0.state == .completed }
         List {
             if !downloads.records.isEmpty {
                 Section {
@@ -28,6 +33,25 @@ struct DownloadsView: View {
             }
         }
         .navigationTitle("下载")
+        .inlineNavigationTitle()
+        .navigationSubtitle(downloads.records.isEmpty ? "" : "\(downloads.records.count) 项 · \(ByteCountFormatter.string(fromByteCount: downloads.totalSize, countStyle: .file))")
+        .toolbar {
+            if !completed.isEmpty {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(role: .destructive) {
+                        confirmClear = true
+                    } label: {
+                        Label("清除已完成", systemImage: "trash")
+                    }
+                }
+            }
+        }
+        .confirmationDialog("清除已完成的下载？", isPresented: $confirmClear, titleVisibility: .visible) {
+            Button("清除 \(completed.count) 项", role: .destructive) { downloads.deleteCompleted() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("这些文件会从本机删除。")
+        }
     }
 }
 
@@ -55,7 +79,33 @@ private struct DownloadRow: View {
         .onTapGesture {
             if record.state == .completed { app.player.play(record.item) }
         }
+        .contextMenu {
+            NavigationLink(value: record.item) {
+                Label("查看详情", systemImage: "info.circle")
+            }
+            if record.state == .completed {
+                Button("播放", systemImage: "play.fill") { app.player.play(record.item) }
+                #if os(macOS)
+                Button("在访达中显示", systemImage: "folder") { reveal() }
+                #endif
+            }
+            if record.state == .downloading || record.state == .queued {
+                Button("暂停", systemImage: "pause") { app.downloads.pause(record) }
+            }
+            if record.state == .paused || record.state == .failed {
+                Button("继续下载", systemImage: "arrow.clockwise") { app.downloads.resume(record) }
+            }
+            Divider()
+            Button("删除", systemImage: "trash", role: .destructive) { app.downloads.delete(record) }
+        }
     }
+
+    #if os(macOS)
+    private func reveal() {
+        guard let url = app.downloads.localURL(for: record) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+    #endif
 
     @ViewBuilder
     private var status: some View {

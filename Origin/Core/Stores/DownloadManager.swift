@@ -29,6 +29,7 @@ final class DownloadManager: NSObject {
     @ObservationIgnored var backgroundCompletionHandler: (() -> Void)?
     @ObservationIgnored private var resumeData: [String: Data] = [:]
     @ObservationIgnored private var tasks: [String: URLSessionDownloadTask] = [:]
+    @ObservationIgnored private var lastProgressSave = Date.distantPast
     @ObservationIgnored private lazy var session: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
         config.isDiscretionary = false
@@ -133,10 +134,36 @@ final class DownloadManager: NSObject {
         save()
     }
 
+    /// 离线播放的进度写在下载记录上，下次打开仍从这里续播
+    func notePlayback(id: String, position: TimeInterval, duration: TimeInterval) {
+        guard position.isFinite, position >= 0 else { return }
+        update(id) { record in
+            if record.item.runtime == nil, duration > 0 { record.item.runtime = duration }
+            record.item.userState.playbackPosition = position
+            if duration > 0, position / duration >= 0.95 {
+                record.item.userState.isPlayed = true
+            }
+        }
+    }
+
+    func deleteCompleted() {
+        for record in records where record.state == .completed {
+            if let url = localURL(for: record) {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        records.removeAll { $0.state == .completed }
+        save()
+    }
+
     private func update(_ id: String, _ change: (inout DownloadRecord) -> Void) {
         guard let index = records.firstIndex(where: { $0.id == id }) else { return }
         change(&records[index])
-        if records[index].state != .downloading { save() }
+        let downloading = records[index].state == .downloading
+        if !downloading || Date().timeIntervalSince(lastProgressSave) >= 1 {
+            lastProgressSave = Date()
+            save()
+        }
     }
 
     private func load() {

@@ -4,24 +4,35 @@ struct LibrariesView: View {
     @Environment(AppModel.self) private var app
     @State private var libraries: [MediaLibrary] = []
     @State private var errorText: String?
+    @State private var partialError: String?
     @State private var isLoading = true
 
     private let columns = [GridItem(.adaptive(minimum: 300), spacing: 16)]
 
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 16) {
-                ForEach(libraries) { library in
-                    NavigationLink(value: Route.library(library)) {
-                        LibraryCard(library: library)
-                    }
-                    .buttonStyle(.plain)
+            VStack(alignment: .leading, spacing: 16) {
+                if let partialError {
+                    Label(partialError, systemImage: "wifi.exclamationmark")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(.regularMaterial, in: .rect(cornerRadius: 12))
                 }
-                if app.client?.supportsFavorites == true {
-                    NavigationLink(value: Route.favorites) {
-                        LibraryCard(library: MediaLibrary(id: "favorites", name: "收藏", kind: .collections, imageURL: nil), symbol: "heart.fill")
+                LazyVGrid(columns: columns, spacing: 16) {
+                    ForEach(libraries) { library in
+                        NavigationLink(value: Route.library(library)) {
+                            LibraryCard(library: library)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
+                    if app.client?.supportsFavorites == true {
+                        NavigationLink(value: Route.favorites) {
+                            LibraryCard(library: MediaLibrary(id: "favorites", name: "收藏", kind: .collections, imageURL: nil), symbol: "heart.fill")
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
             }
             .padding()
@@ -36,6 +47,7 @@ struct LibrariesView: View {
             }
         }
         .navigationTitle("媒体库")
+        .inlineNavigationTitle()
         .toolbar {
             ToolbarItem(placement: .primaryAction) { ServerMenu() }
         }
@@ -44,21 +56,19 @@ struct LibrariesView: View {
     }
 
     private func load() async {
-        guard !app.homeAccounts.isEmpty else { return }
+        guard !app.homeAccounts.isEmpty else {
+            libraries = []
+            partialError = nil
+            errorText = nil
+            isLoading = false
+            return
+        }
         isLoading = true
         defer { isLoading = false }
         let result = await app.collectLibraries()
-        if result.isEmpty, let client = app.client {
-            do {
-                libraries = try await client.libraries()
-                errorText = nil
-            } catch {
-                errorText = error.localizedDescription
-            }
-        } else {
-            libraries = result
-            errorText = nil
-        }
+        libraries = result.libraries
+        partialError = result.libraries.isEmpty ? nil : result.failure.map { "有的服务器暂时连不上：\($0)" }
+        errorText = result.libraries.isEmpty ? result.failure : nil
     }
 }
 
@@ -134,10 +144,13 @@ struct ItemsGridView: View {
 
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 18) {
+            LazyVGrid(columns: gridColumns, spacing: 18) {
                 ForEach(items) { item in
                     NavigationLink(value: item) {
-                        PosterCard(item: item)
+                        VStack(alignment: .leading, spacing: 4) {
+                            itemCard(item)
+                            if case .favorites = source { serverCaption(item) }
+                        }
                     }
                     .buttonStyle(.plain)
                     .contextMenu { ItemContextMenu(item: item) }
@@ -163,7 +176,8 @@ struct ItemsGridView: View {
             }
         }
         .navigationTitle(source.title)
-        .navigationSubtitle(total > 0 ? "\(total) 项" : "")
+        .inlineNavigationTitle()
+        .navigationSubtitle(gridSubtitle)
         .toolbar {
             if source != .favorites, client?.supportsLibraryQuery != false {
                 ToolbarItem(placement: .primaryAction) { sortMenu }
@@ -177,6 +191,45 @@ struct ItemsGridView: View {
                 genres = (try? await client?.genres(parentID: parentID)) ?? []
             }
         }
+    }
+
+    private var gridColumns: [GridItem] {
+        let episodesOnly = !items.isEmpty && items.allSatisfy { $0.kind == .episode }
+        if episodesOnly {
+            return [GridItem(.adaptive(minimum: 220), spacing: 14, alignment: .top)]
+        }
+        return columns
+    }
+
+    @ViewBuilder
+    private func itemCard(_ item: MediaItem) -> some View {
+        if item.kind == .episode {
+            ThumbCard(item: item)
+        } else {
+            PosterCard(item: item)
+        }
+    }
+
+    @ViewBuilder
+    private func serverCaption(_ item: MediaItem) -> some View {
+        if app.homeAccounts.count > 1, let name = app.accounts.first(where: { $0.id == item.serverID })?.name {
+            Text(name)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private var gridSubtitle: String {
+        var parts: [String] = []
+        if total > 0 { parts.append("\(total) 项") }
+        if source != .favorites {
+            parts.append(query.sort.title)
+            if !query.ascending { parts.append("降序") }
+            if query.filter != .all { parts.append(query.filter.title) }
+            if let genre = query.genre { parts.append(genre) }
+        }
+        return parts.joined(separator: " · ")
     }
 
     private var sortMenu: some View {
