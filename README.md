@@ -41,3 +41,9 @@ Xcode 里运行 Origin（iPhone / iPad）或 OriginMac。
 播放使用 [KSPlayer](https://github.com/kingslay/KSPlayer) 和 FFmpeg，二者为 GPL-3.0。本仓库源码同样按 GPL-3.0 提供。
 
 影片资料来自 TMDB。Origin 使用 TMDB API，但没有获得 TMDB 的认可或认证。
+
+## 支持作者
+
+Origin 免费使用。如果它帮你看完了一部片，可以用微信扫下面的码支持作者。
+
+![微信赞赏，账户名喜欢可爱](打赏码.JPG)
