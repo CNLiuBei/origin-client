@@ -90,7 +90,8 @@ struct PlayerScreenChrome<Model: PlayerSurface>: View {
         #if os(iOS)
         .sheet(isPresented: $model.showEpisodes) {
             EpisodeBrowser(model: model)
-                .presentationDetents([.medium, .large])
+                .presentationDetents([.height(340)])
+                .presentationDragIndicator(.visible)
         }
         #endif
     }
@@ -467,7 +468,7 @@ private struct EpisodeMenu<Model: PlayerSurface>: View {
         iconButton
             .popover(isPresented: $isPresented, arrowEdge: .top) {
                 EpisodeList(model: model) { isPresented = false }
-                    .frame(width: 400, height: 480)
+                    .frame(width: 560)
             }
     }
 
@@ -504,9 +505,10 @@ private struct EpisodeList<Model: PlayerSurface>: View {
     @Bindable var model: Model
     var onSelect: () -> Void
     @State private var seasonKey: String?
+    @State private var focusedEpisode: String?
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 8) {
             if seasonGroups.count > 1 {
                 Picker("季", selection: seasonSelection) {
                     ForEach(seasonGroups, id: \.key) { group in
@@ -515,34 +517,35 @@ private struct EpisodeList<Model: PlayerSurface>: View {
                 }
                 .pickerStyle(.menu)
                 .labelsHidden()
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
                 .accessibilityLabel("季")
             }
-            ScrollViewReader { proxy in
-                List(visibleEpisodes) { episode in
-                    Button {
-                        guard episode.id != model.session.item.id else { return }
-                        onSelect()
-                        model.play(episode, resume: nil)
-                    } label: {
-                        EpisodeRow(episode: episode, isCurrent: episode.id == model.session.item.id)
+            ScrollView(.horizontal) {
+                LazyHStack(alignment: .top, spacing: 12) {
+                    ForEach(visibleEpisodes) { episode in
+                        Button {
+                            guard episode.id != model.session.item.id else { return }
+                            onSelect()
+                            model.play(episode, resume: nil)
+                        } label: {
+                            EpisodeRow(episode: episode, isCurrent: episode.id == model.session.item.id)
+                        }
+                        .buttonStyle(.plain)
+                        .id(episode.id)
                     }
-                    #if os(macOS)
-                    .buttonStyle(.borderless)
-                    #else
-                    .buttonStyle(.plain)
-                    #endif
-                    .id(episode.id)
                 }
-                #if os(macOS)
-                .listStyle(.inset)
-                #endif
-                .onAppear { revealCurrent(using: proxy) }
-                .onChange(of: seasonKey ?? currentSeasonKey) { _, _ in revealCurrent(using: proxy) }
+                .scrollTargetLayout()
+                .padding(.horizontal, 16)
             }
+            .scrollTargetBehavior(.viewAligned)
+            .scrollPosition(id: $focusedEpisode, anchor: .center)
+            .scrollIndicators(.visible)
+            .frame(height: 176)
+            .onAppear { focusCurrent() }
+            .onChange(of: seasonKey ?? currentSeasonKey) { _, _ in focusCurrent() }
         }
+        .padding(.vertical, 12)
     }
 
     private var seasonSelection: Binding<String> {
@@ -578,11 +581,9 @@ private struct EpisodeList<Model: PlayerSurface>: View {
         }
     }
 
-    private func revealCurrent(using proxy: ScrollViewProxy) {
+    private func focusCurrent() {
         let current = model.session.item.id
-        let target = visibleEpisodes.contains { $0.id == current } ? current : visibleEpisodes.first?.id
-        guard let target else { return }
-        proxy.scrollTo(target, anchor: target == current ? .center : .top)
+        focusedEpisode = visibleEpisodes.contains { $0.id == current } ? current : visibleEpisodes.first?.id
     }
 }
 
@@ -591,34 +592,34 @@ private struct EpisodeRow: View {
     let isCurrent: Bool
 
     var body: some View {
-        HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             RemoteImage(url: episode.thumbURL, aspectRatio: 16 / 9)
-                .frame(width: 112)
-                .clipShape(.rect(cornerRadius: 6))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                if let detail {
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                .frame(width: 168)
+                .clipShape(.rect(cornerRadius: 8))
+                .overlay(alignment: .topTrailing) {
+                    if !isCurrent {
+                        WatchBadge(item: episode).padding(6)
+                    }
                 }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            if isCurrent {
-                Image(systemName: "speaker.wave.2.fill")
+                .overlay {
+                    if isCurrent {
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(.white, lineWidth: 2.5)
+                    }
+                }
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .lineLimit(2, reservesSpace: true)
+                .multilineTextAlignment(.leading)
+            if let detail {
+                Text(detail)
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .accessibilityLabel("正在播放")
-            } else if episode.userState.isPlayed {
-                Image(systemName: "checkmark")
-                    .foregroundStyle(.tertiary)
-                    .accessibilityLabel("已观看")
+                    .lineLimit(1)
             }
         }
+        .frame(width: 168, alignment: .topLeading)
         .contentShape(.rect)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityText)
