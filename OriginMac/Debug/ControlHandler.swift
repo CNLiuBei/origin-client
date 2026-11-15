@@ -203,22 +203,30 @@ final class ControlHandler {
         guard let address = request.string("address")?.normalizedServerURL, let username = request.string("username") else {
             return .error("需要 address 与 username（password 可选）")
         }
-        var found: (URL, ServerKind)?
-        for candidate in await ServerEndpoint.candidates(for: address) {
-            if let (kind, _) = try? await JellyfinClient.probe(baseURL: candidate, timeout: 6) {
-                found = (candidate, kind)
-                break
+        let targets = await ServerEndpoint.candidates(for: address)
+        let found: (URL, ServerKind)
+        do {
+            found = try await ServerEndpoint.firstReachable(targets, isMiss: { error in
+                if error is CancellationError { return true }
+                if let urlError = error as? URLError, urlError.code == .cancelled { return true }
+                return true
+            }) { candidate in
+                let kind = try await JellyfinClient.probe(baseURL: candidate, timeout: 6).0
+                return (candidate, kind)
             }
+        } catch {
+            return .error("未识别到 Jellyfin、Emby 或飞牛影视服务器")
         }
-        guard let (url, kind) = found else { return .error("未识别到 Jellyfin、Emby 或飞牛影视服务器") }
+        let (url, kind) = found
+        let stored = ServerEndpoint.addressToStore(entered: address, reached: url)
         let result = try await JellyfinClient.authenticate(baseURL: url, kind: kind, username: username, password: request.string("password") ?? "")
-        if let existing = app.accounts.first(where: { $0.baseURL == url && $0.userID == result.userID }) {
+        if let existing = app.accounts.first(where: { $0.baseURL == stored && $0.userID == result.userID }) {
             app.add(existing, token: result.token)
-            return .json(["ok": true, "account": existing.id.uuidString, "url": url.absoluteString, "note": "账号已存在，已更新令牌并切换"])
+            return .json(["ok": true, "account": existing.id.uuidString, "url": stored.absoluteString, "note": "账号已存在，已更新令牌并切换"])
         }
-        let account = ServerAccount(id: UUID(), kind: kind, name: result.serverName, baseURL: url, userID: result.userID, username: result.username)
+        let account = ServerAccount(id: UUID(), kind: kind, name: result.serverName, baseURL: stored, userID: result.userID, username: result.username)
         app.add(account, token: result.token)
-        return .json(["ok": true, "account": account.id.uuidString, "kind": kind.rawValue, "server": result.serverName, "url": url.absoluteString])
+        return .json(["ok": true, "account": account.id.uuidString, "kind": kind.rawValue, "server": result.serverName, "url": stored.absoluteString])
     }
 
     private func selectServer(_ request: ControlRequest) -> ControlResponse {

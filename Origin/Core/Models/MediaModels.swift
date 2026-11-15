@@ -6,9 +6,9 @@ enum ServerKind: String, Codable, CaseIterable, Identifiable, Sendable {
     case plex
     case fnos
 
-    var id: String { rawValue }
+    nonisolated var id: String { rawValue }
 
-    var displayName: String {
+    nonisolated var displayName: String {
         switch self {
         case .jellyfin: "Jellyfin"
         case .emby: "Emby"

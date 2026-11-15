@@ -1,45 +1,91 @@
 import SwiftUI
 
+/// 设置首页只列分组入口，具体选项放进各自的子页面
 struct SettingsView: View {
+    @Environment(AppModel.self) private var app
+
     var body: some View {
         Form {
             #if os(macOS)
             ServerSettingsSection()
             #endif
-            SyncSettingsSection()
-            EngineSettingsSection()
-            PlaybackSettingsSection()
-            LanguageSettingsSection()
-            SubtitleStyleSection()
-            MetadataSettingsSection()
-            StorageSettingsSection()
-            AboutSettingsSection()
+            Section {
+                row("播放", symbol: "play.fill", color: .red, value: app.settings.engine.shortTitle) {
+                    SettingsPage("播放") {
+                        EngineSettingsSection()
+                        PlaybackSettingsSection()
+                    }
+                }
+                row("音频与字幕", symbol: "captions.bubble.fill", color: .orange, value: app.settings.audioLanguage.title) {
+                    SettingsPage("音频与字幕") {
+                        LanguageSettingsSection()
+                        SubtitleStyleSection()
+                    }
+                }
+                row("元数据", symbol: "film.stack.fill", color: .indigo, value: app.settings.tmdbEnabled ? "TMDB" : "关闭") {
+                    SettingsPage("元数据") { MetadataSettingsSection() }
+                }
+            }
+            Section {
+                row("同步", symbol: "arrow.triangle.2.circlepath", color: .blue,
+                    value: app.lanSync.enabled ? app.lanSync.statusTitle : app.cloudSync.statusTitle) {
+                    ServerSyncView()
+                }
+                row("存储", symbol: "internaldrive.fill", color: .gray,
+                    value: ByteCountFormatter.string(fromByteCount: Int64(app.downloads.totalSize), countStyle: .file)) {
+                    SettingsPage("存储") { StorageSettingsSection() }
+                }
+            }
+            Section {
+                row("关于", symbol: "info.circle.fill", color: .gray, value: "版本 \(DeviceInfo.version)") {
+                    SettingsPage("关于") { AboutSettingsSection() }
+                }
+            }
         }
         .formStyle(.grouped)
         .navigationTitle("设置")
         .inlineNavigationTitle()
     }
-}
 
-// MARK: - 同步
-
-private struct SyncSettingsSection: View {
-    @Environment(AppModel.self) private var app
-
-    var body: some View {
-        Section("同步") {
-            NavigationLink {
-                ServerSyncView()
+    private func row(_ title: String, symbol: String, color: Color, value: String,
+                     @ViewBuilder destination: @escaping () -> some View) -> some View {
+        NavigationLink(destination: destination) {
+            LabeledContent {
+                Text(value).lineLimit(1)
             } label: {
-                LabeledContent("iCloud 同步") {
-                    HStack(spacing: 6) {
-                        SyncDeviceIcons()
-                        Text(app.cloudSync.statusTitle)
-                    }
-                    .foregroundStyle(.secondary)
+                Label {
+                    Text(title)
+                } icon: {
+                    TintedIcon(symbol: symbol, color: color, size: iconSize)
                 }
             }
         }
+    }
+
+    private var iconSize: CGFloat {
+        #if os(macOS)
+        22
+        #else
+        29
+        #endif
+    }
+}
+
+/// 设置子页面：同样的分组表单，只换标题
+private struct SettingsPage<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: Content
+
+    init(_ title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        Form { content }
+            .formStyle(.grouped)
+            .navigationTitle(title)
+            .inlineNavigationTitle()
     }
 }
 
@@ -151,7 +197,7 @@ private struct PlaybackSettingsSection: View {
             }
             .pickerStyle(.menu)
         } header: {
-            Text("播放")
+            Text("播放控制")
         } footer: {
             Text("有标记时，询问会显示跳过按钮，自动跳过会直接跳过。片头含前情和广告，片尾含预告。")
         }
@@ -163,7 +209,7 @@ private struct LanguageSettingsSection: View {
 
     var body: some View {
         @Bindable var settings = app.settings
-        Section("音频与字幕") {
+        Section("首选语言") {
             Picker("首选音轨", selection: $settings.audioLanguage) {
                 ForEach(LanguagePreference.allCases.filter { $0 != .none }) { language in
                     Text(language.title).tag(language)

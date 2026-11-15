@@ -49,12 +49,17 @@ struct SearchView: View {
                 isSearching = false
                 return
             }
-            var merged: [MediaItem] = []
-            for account in accounts {
-                guard !Task.isCancelled else { return }
-                if let found = try? await app.client(for: account.id)?.search(term, limit: 40) {
-                    merged.append(contentsOf: found)
-                }
+            // 各服务器同时搜索，按列表顺序合并，连不上的那台不拖住别的
+            let tasks = accounts.compactMap { account -> Task<[MediaItem], Never>? in
+                guard let client = app.client(for: account.id) else { return nil }
+                return Task { (try? await client.search(term, limit: 40)) ?? [] }
+            }
+            let merged = await withTaskCancellationHandler {
+                var merged: [MediaItem] = []
+                for task in tasks { merged.append(contentsOf: await task.value) }
+                return merged
+            } onCancel: {
+                for task in tasks { task.cancel() }
             }
             guard !Task.isCancelled else { return }
             results = merged

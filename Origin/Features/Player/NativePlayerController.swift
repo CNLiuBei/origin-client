@@ -564,6 +564,14 @@ final class NativePlayerController: NSObject {
         showControls()
     }
 
+    var handoffTargets: [LANPeer] { presenter?.handoffTargets ?? [] }
+
+    func handOff(to peer: LANPeer) {
+        guard presenter?.handOff(session, at: currentTime, to: peer) == true else { return }
+        player.pause()
+        close()
+    }
+
     func togglePiP() {
         preparePictureInPicture()
         guard let pipController else { return }
@@ -820,7 +828,7 @@ final class NativePlayerController: NSObject {
     private func loadArtwork(for session: PlaybackSession, item: AVPlayerItem) {
         guard let url = session.item.thumbURL ?? session.item.backdropURL ?? session.item.posterURL else { return }
         Task {
-            guard let (data, _) = try? await URLSession.shared.data(for: MediaRequestAuth.request(for: url)),
+            guard let (data, _) = try? await OriginTrust.session(for: url).data(for: MediaRequestAuth.request(for: url)),
                   let jpeg = await ImageDecoding.jpegData(from: data) else { return }
             item.externalMetadata = Self.metadata(for: session, artwork: jpeg)
         }

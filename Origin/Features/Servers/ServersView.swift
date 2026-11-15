@@ -22,11 +22,25 @@ enum ServerHealth {
         var version: String?
         var latency: Duration?
         if account.kind != .plex {
-            let start = clock.now
+            let timeout = min(6, account.advanced.timeout)
+            let alternates = account.backupLines.map(\.url)
+            var endpoint = await ServerRoute.shared.resolve(account.connectionURL, timeout: timeout, allowsInsecureTLS: account.advanced.allowsInsecureTLS, alternates: alternates)
             do {
-                version = try await JellyfinClient.probe(baseURL: account.connectionURL, timeout: min(6, account.advanced.timeout),
-                                                         allowsInsecureTLS: account.advanced.allowsInsecureTLS).1.version
+                let start = clock.now
+                version = try await JellyfinClient.probe(baseURL: endpoint, timeout: timeout, allowsInsecureTLS: account.advanced.allowsInsecureTLS).1.version
                 latency = clock.now - start
+            } catch let error where ServerEndpoint.isUnreachable(error) {
+                ServerRoute.shared.invalidate(account.connectionURL, excluding: endpoint)
+                let retry = await ServerRoute.shared.resolve(account.connectionURL, timeout: timeout, allowsInsecureTLS: account.advanced.allowsInsecureTLS, alternates: alternates)
+                guard retry != endpoint else { return .offline(friendlyMessage(for: error)) }
+                endpoint = retry
+                do {
+                    let start = clock.now
+                    version = try await JellyfinClient.probe(baseURL: endpoint, timeout: timeout, allowsInsecureTLS: account.advanced.allowsInsecureTLS).1.version
+                    latency = clock.now - start
+                } catch {
+                    return .offline(friendlyMessage(for: error))
+                }
             } catch {
                 return .offline(friendlyMessage(for: error))
             }
@@ -317,12 +331,14 @@ struct ServersView: View {
     @ViewBuilder
     private func serverActions(for account: ServerAccount) -> some View {
         Button("服务配置", systemImage: "slider.horizontal.3") { openEditor(account, password: false) }
-        Button(account.aggregationDisabled ? "启用聚合" : "禁用聚合",
-               systemImage: account.aggregationDisabled ? "square.stack.3d.up" : "square.stack.3d.up.slash") {
-            var updated = account
-            updated.aggregationDisabled.toggle()
-            app.update(updated)
-        }
+        Toggle("在首页和媒体库显示", systemImage: "square.stack.3d.up", isOn: Binding(
+            get: { !account.aggregationDisabled },
+            set: { shown in
+                var updated = account
+                updated.aggregationDisabled = !shown
+                app.update(updated)
+            }
+        ))
         Button("设为默认首页", systemImage: "house") {
             Task { await app.setDefaultHome(account) }
         }
@@ -376,7 +392,7 @@ struct ServersView: View {
     private func statusCaption(_ status: ServerStatus?) -> String {
         switch status {
         case nil, .checking: "检测中"
-        case .online: "在线"
+        case let .online(latency, _): "在线 · \(latency) ms"
         case .expired: "登录已失效"
         case .offline: "无法连接"
         }
@@ -401,16 +417,19 @@ struct ServersView: View {
         var switches: [(UUID, UUID?)] = []
         await withTaskGroup(of: (UUID, ServerStatus, UUID?).self) { group in
             for account in accounts {
-                group.addTask { 
+                group.addTask {
                     let (status, line) = await ServerHealth.resolve(account)
                     return (account.id, status, line)
                 }
             }
             for await (id, status, line) in group {
+                // 被取消的请求不代表连不上，交给下一轮
+                guard !Task.isCancelled else { continue }
                 statuses[id] = status
                 if case .online = status { switches.append((id, line)) }
             }
         }
+        guard !Task.isCancelled else { return }
         for (id, line) in switches {
             app.applyResolvedLine(id, lineID: line)
         }
@@ -432,7 +451,7 @@ struct ServerDetailView: View {
     @State private var host = ""
     @State private var path = ""
     @State private var port = ""
-    @State private var useHTTPS = false
+    @State private var scheme: ServerScheme = .http
     @State private var username = ""
     @State private var password = ""
     @State private var plexToken = ""
@@ -475,7 +494,7 @@ struct ServerDetailView: View {
             }
 
             Section("服务器地址") {
-                ServerAddressFields(host: $host, path: $path, port: $port, useHTTPS: $useHTTPS, onEdit: clearError)
+                ServerAddressFields(host: $host, path: $path, port: $port, scheme: $scheme, onEdit: clearError)
             }
 
             Section("登录信息") {
@@ -575,27 +594,24 @@ struct ServerDetailView: View {
         host = parts.host
         path = parts.path
         port = parts.port
-        useHTTPS = parts.https
+        scheme = parts.scheme
         username = account.username
         backupLines = account.backupLines
         timeout = account.advanced.timeout
         allowsInsecureTLS = account.advanced.allowsInsecureTLS
     }
 
-    private func composedURL() -> URL? {
-        ServerAddress.compose(host: host, path: path, port: port, https: useHTTPS)
-    }
-
     private func commit(force: Bool) {
         guard let account, !isWorking else { return }
-        ServerAddress.absorb(host: &host, path: &path, port: &port, https: &useHTTPS)
+        ServerAddress.absorb(host: &host, path: &path, port: &port, scheme: &scheme)
         let portText = port.trimmingCharacters(in: .whitespacesAndNewlines)
         if !portText.isEmpty, Int(portText).map({ (1 ... 65535).contains($0) }) != true {
             errorText = "端口应为 1 到 65535 的数字"
             canForce = false
             return
         }
-        guard let url = composedURL() else {
+        let targets = ServerAddress.probeURLs(host: host, path: path, port: port, scheme: scheme, alternatePorts: [])
+        guard let url = targets.first else {
             errorText = host.contains("/") ? "路径请写在下面的路径一栏" : "请填写主机"
             canForce = false
             return
@@ -624,72 +640,80 @@ struct ServerDetailView: View {
         let shouldConnect = !force && (addressChanged || !secret.isEmpty || userChanged)
         Task {
             defer { isWorking = false }
-            let targets = shouldConnect ? await ServerEndpoint.candidates(for: url, alternatePorts: []) : [url]
-            var lastError: Error?
-            for target in targets {
-                var updated = account
-                updated.name = finalName
-                updated.note = finalNote
-                updated.baseURL = target
-                updated.backupLines = backupLines
-                if updated.activeLineID != nil, !backupLines.contains(where: { $0.id == updated.activeLineID }) {
-                    updated.activeLineID = nil
-                }
-                updated.advanced = ServerAdvanced(timeout: timeout, allowsInsecureTLS: allowsInsecureTLS)
-                var newToken: String?
+            let connectURL: URL
+            if shouldConnect {
+                let probeTimeout = timeout
+                let insecure = allowsInsecureTLS
+                let kind = account.kind
+                let tokenForProbe = secret.isEmpty ? account.token ?? "" : secret
+                let checkPlex = addressChanged || !secret.isEmpty
+                var signedHeaders = PlexClient.clientHeaders
+                signedHeaders["X-Plex-Token"] = tokenForProbe
+                let plexHeaders = signedHeaders
                 do {
-                    if shouldConnect {
-                        if account.kind == .plex {
-                            if addressChanged || !secret.isEmpty {
-                                try await validatePlex(url: target, token: secret.isEmpty ? account.token ?? "" : secret)
-                                if !secret.isEmpty { newToken = secret }
+                    if kind == .plex, !checkPlex {
+                        connectURL = url
+                    } else {
+                        connectURL = try await ServerEndpoint.firstReachableAmong(targets) { candidate in
+                            if kind == .plex {
+                                _ = try await HTTPClient(timeout: probeTimeout, allowsInsecureTLS: insecure)
+                                    .data(candidate.appending(path: "/library/sections", query: [:]), headers: plexHeaders)
+                            } else {
+                                let found = try await JellyfinClient.probe(baseURL: candidate, timeout: probeTimeout, allowsInsecureTLS: insecure).0
+                                guard found == kind else {
+                                    throw APIError.message("该地址是\(found.displayName)服务器，与原来的\(kind.displayName)不一致，请添加为新服务器。")
+                                }
                             }
-                        } else if !secret.isEmpty || userChanged {
-                            let result = try await JellyfinClient.authenticate(baseURL: target, kind: account.kind, username: finalUser, password: secret,
-                                                                               allowsInsecureTLS: allowsInsecureTLS, timeout: timeout)
-                            updated.userID = result.userID
-                            updated.username = result.username
-                            newToken = result.token
-                        } else if addressChanged {
-                            let kind = try await JellyfinClient.probe(baseURL: target, timeout: timeout, allowsInsecureTLS: allowsInsecureTLS).0
-                            guard kind == account.kind else {
-                                errorText = "该地址是\(kind.displayName)服务器，与原来的\(account.kind.displayName)不一致，请添加为新服务器。"
-                                return
-                            }
-                            _ = try await ServerHealth.client(for: updated).libraries()
+                            return candidate
                         }
                     }
-                    if newToken == nil { updated.username = finalUser }
-                    app.update(updated, token: newToken)
-                    dismiss()
-                    return
-                } catch let error where ServerEndpoint.isUnreachable(error) {
-                    lastError = error
-                } catch APIError.unauthorized {
-                    if !secret.isEmpty || userChanged {
-                        errorText = account.kind == .plex ? "Token 无效或无权访问这台服务器" : "用户名或密码不正确"
-                    } else {
-                        errorText = "能连上该地址，但当前登录在这台服务器上无效，可能不是同一台服务器。"
-                        canForce = true
-                    }
-                    return
                 } catch {
                     errorText = friendlyMessage(for: error)
-                    canForce = addressChanged && secret.isEmpty
+                    canForce = addressChanged && secret.isEmpty && ServerEndpoint.isUnreachable(error)
                     return
                 }
+            } else {
+                connectURL = url
             }
-            if let lastError {
-                errorText = friendlyMessage(for: lastError)
+
+            var updated = account
+            updated.name = finalName
+            updated.note = finalNote
+            updated.baseURL = ServerEndpoint.addressToStore(entered: url, reached: connectURL)
+            updated.backupLines = backupLines
+            if updated.activeLineID != nil, !backupLines.contains(where: { $0.id == updated.activeLineID }) {
+                updated.activeLineID = nil
+            }
+            updated.advanced = ServerAdvanced(timeout: timeout, allowsInsecureTLS: allowsInsecureTLS)
+            var newToken: String?
+            do {
+                if shouldConnect {
+                    if account.kind == .plex {
+                        if !secret.isEmpty { newToken = secret }
+                    } else if !secret.isEmpty || userChanged {
+                        let result = try await JellyfinClient.authenticate(baseURL: connectURL, kind: account.kind, username: finalUser, password: secret,
+                                                                           allowsInsecureTLS: allowsInsecureTLS, timeout: timeout)
+                        updated.userID = result.userID
+                        updated.username = result.username
+                        newToken = result.token
+                    } else if addressChanged {
+                        _ = try await ServerHealth.client(for: updated).libraries()
+                    }
+                }
+                if newToken == nil { updated.username = finalUser }
+                app.update(updated, token: newToken)
+                dismiss()
+            } catch APIError.unauthorized {
+                if !secret.isEmpty || userChanged {
+                    errorText = account.kind == .plex ? "Token 无效或无权访问这台服务器" : "用户名或密码不正确"
+                } else {
+                    errorText = "能连上该地址，但当前登录在这台服务器上无效，可能不是同一台服务器。"
+                    canForce = true
+                }
+            } catch {
+                errorText = friendlyMessage(for: error)
                 canForce = addressChanged && secret.isEmpty
             }
         }
-    }
-
-    private func validatePlex(url: URL, token: String) async throws {
-        var headers = PlexClient.clientHeaders
-        headers["X-Plex-Token"] = token
-        _ = try await HTTPClient(timeout: timeout, allowsInsecureTLS: allowsInsecureTLS)
-            .data(url.appending(path: "/library/sections", query: [:]), headers: headers)
     }
 }

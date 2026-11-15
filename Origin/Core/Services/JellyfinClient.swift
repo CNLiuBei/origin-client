@@ -15,7 +15,23 @@ final class JellyfinClient: MediaServerClient {
 
     private var isEmby: Bool { account.kind == .emby }
     private var isFnOS: Bool { account.kind == .fnos }
-    private var baseURL: URL { account.connectionURL }
+    private var baseURL: URL { ServerRoute.shared.cached(account.connectionURL) ?? account.connectionURL }
+
+    private var learnedRemote = false
+
+    private func withRoute<T>(_ body: () async throws -> T) async throws -> T {
+        let alternates = account.backupLines.map(\.url) + ServerRoute.shared.remembered(for: account.connectionURL)
+        return try await ServerRoute.shared.perform(
+            stored: account.connectionURL,
+            timeout: account.advanced.timeout,
+            allowsInsecureTLS: account.advanced.allowsInsecureTLS,
+            alternates: alternates,
+            register: { url in
+                MediaRequestAuth.register(url, headers: self.streamHeaders)
+            },
+            body
+        )
+    }
     private var userID: String { account.userID }
 
     private static let listFields = "Overview,Genres,ProductionYear,ProviderIds,DateCreated,ChildCount,PrimaryImageAspectRatio,OfficialRating,CommunityRating"
@@ -101,12 +117,16 @@ final class JellyfinClient: MediaServerClient {
     // MARK: - 请求
 
     private func get<T: Decodable>(_ type: T.Type, _ path: String, _ query: [String: String?] = [:]) async throws -> T {
-        try await http.decode(T.self, from: url(path, query), headers: headers, decoder: .pascalCase)
+        try await withRoute {
+            try await self.http.decode(T.self, from: self.url(path, query), headers: self.headers, decoder: .pascalCase)
+        }
     }
 
     private func send(_ method: String, _ path: String, _ query: [String: String?] = [:], body: [String: Any]? = nil) async throws {
         let data = try body.map { try JSONSerialization.data(withJSONObject: $0) }
-        _ = try await http.data(url(path, query), method: method, headers: headers, body: data)
+        try await withRoute {
+            _ = try await self.http.data(self.url(path, query), method: method, headers: self.headers, body: data)
+        }
     }
 
     private func url(_ path: String, _ query: [String: String?]) -> URL {
@@ -136,6 +156,7 @@ final class JellyfinClient: MediaServerClient {
 
     func libraries() async throws -> [MediaLibrary] {
         let result = try await get(ItemsResponse.self, userPath("/UserViews", emby: "/Views"), userQuery)
+        learnRemoteIfNeeded()
         return result.items.compactMap { dto in
             let kind: LibraryKind
             switch dto.collectionType?.lowercased() {
@@ -147,6 +168,22 @@ final class JellyfinClient: MediaServerClient {
             }
             return MediaLibrary(id: dto.id, name: dto.name ?? "", kind: kind, imageURL: image(dto.id, "Primary", tag: dto.imageTags?.value("primary"), width: 800))
         }
+    }
+
+    /// 局域网连上后记下服务器公布的公网地址，蜂窝网络下可以改走它。
+    private func learnRemoteIfNeeded() {
+        guard !learnedRemote else { return }
+        learnedRemote = true
+        Task { await learnRemote() }
+    }
+
+    private func learnRemote() async {
+        struct Info: Decodable { let wanAddress: String? }
+        guard let info = try? await get(Info.self, "/System/Info"),
+              let text = info.wanAddress,
+              let remote = text.normalizedServerURL else { return }
+        ServerRoute.shared.remember(remote, for: account.connectionURL)
+        ServerRoute.shared.remember(remote, for: account.baseURL)
     }
 
     func resumeItems(limit: Int) async throws -> [MediaItem] {

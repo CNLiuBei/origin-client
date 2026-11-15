@@ -40,6 +40,8 @@ protocol PlayerSurface: AnyObject, Observable {
     var subtitleDelay: Double { get }
     var engineName: String { get }
     var volume: Float { get }
+    /// 可以接着播放的同组设备
+    var handoffTargets: [LANPeer] { get }
 
     func togglePlay()
     func skip(_ seconds: Int)
@@ -51,6 +53,8 @@ protocol PlayerSurface: AnyObject, Observable {
     func playNext()
     func close()
     func togglePiP()
+    /// 交给另一台设备接着播放，本机停止
+    func handOff(to peer: LANPeer)
     func toggleFill()
     func toggleLock()
     func showControls(autoHide: Bool)
@@ -159,6 +163,7 @@ struct PlayerChrome<Model: PlayerSurface>: View {
                         .frame(width: 36, height: 36)
                         .glassEffect(.clear.interactive(), in: .circle)
                         .accessibilityLabel("AirPlay")
+                    handoffMenu
                     if AVPictureInPictureController.isPictureInPictureSupported() {
                         iconButton("pip.enter", label: "画中画") { model.togglePiP() }
                     }
@@ -228,6 +233,7 @@ struct PlayerChrome<Model: PlayerSurface>: View {
                             .glassEffect(.clear.interactive(), in: .circle)
                             .accessibilityLabel("AirPlay")
                             .help("AirPlay")
+                        handoffMenu
                         iconButton("pip.enter", label: "画中画") { model.togglePiP() }
                         iconButton("info.circle", label: "播放信息") { model.showInfo = true }
                         #endif
@@ -276,6 +282,21 @@ struct PlayerChrome<Model: PlayerSurface>: View {
         }
     }
     #endif
+
+    /// 局域网里已连上的同组设备，选一台从当前位置接着播放
+    @ViewBuilder
+    private var handoffMenu: some View {
+        let targets = model.handoffTargets
+        if !targets.isEmpty {
+            symbolMenu("在其他设备上播放", systemImage: "laptopcomputer.and.iphone") {
+                Section("在这台设备上接着播放") {
+                    ForEach(targets) { peer in
+                        Button(peer.name, systemImage: peer.symbol) { model.handOff(to: peer) }
+                    }
+                }
+            }
+        }
+    }
 
     private var rateMenu: some View {
         Menu {

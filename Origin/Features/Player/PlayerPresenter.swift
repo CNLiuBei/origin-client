@@ -2,6 +2,8 @@ import AVKit
 import Observation
 #if os(iOS)
 import UIKit
+#else
+import AppKit
 #endif
 
 /// 负责选择播放引擎并呈现播放器：iOS 上全屏弹出，macOS 上在独立的播放窗口中显示
@@ -26,23 +28,25 @@ final class PlayerPresenter {
     private(set) var isPreparing = false
     var errorMessage: String?
     @ObservationIgnored private var playGeneration = 0
-    @ObservationIgnored private var lastRequest: (MediaItem, Bool?, String?)?
+    @ObservationIgnored private var lastRequest: (MediaItem, Bool?, String?, TimeInterval?)?
 
     init(app: AppModel) {
         self.app = app
     }
 
-    /// - Parameter resume: nil 表示按设置决定是否续播
-    func play(_ item: MediaItem, resume: Bool? = nil, sourceID: String? = nil) {
+    /// - Parameters:
+    ///   - resume: nil 表示按设置决定是否续播
+    ///   - startAt: 从指定位置开始，优先于续播设置
+    func play(_ item: MediaItem, resume: Bool? = nil, sourceID: String? = nil, startAt: TimeInterval? = nil) {
         guard !isPreparing else { return }
-        lastRequest = (item, resume, sourceID)
+        lastRequest = (item, resume, sourceID, startAt)
         playGeneration += 1
         let generation = playGeneration
         isPreparing = true
         Task {
             let session: PlaybackSession
             do {
-                session = try await makeSession(for: item, resume: resume, sourceID: sourceID)
+                session = try await makeSession(for: item, resume: resume, sourceID: sourceID, startAt: startAt)
             } catch {
                 guard playGeneration == generation else { return }
                 isPreparing = false
@@ -62,10 +66,45 @@ final class PlayerPresenter {
 
     func retryLast() {
         guard let lastRequest else { return }
-        play(lastRequest.0, resume: lastRequest.1, sourceID: lastRequest.2)
+        play(lastRequest.0, resume: lastRequest.1, sourceID: lastRequest.2, startAt: lastRequest.3)
     }
 
-    func makeSession(for item: MediaItem, resume: Bool?, sourceID: String? = nil) async throws -> PlaybackSession {
+    /// 已连上、可以接着播放的同组设备
+    var handoffTargets: [LANPeer] {
+        app.lanSync.enabled ? app.lanSync.peers.filter(\.isConnected) : []
+    }
+
+    /// 让另一台设备从当前位置接着播放
+    func handOff(_ session: PlaybackSession, at position: TimeInterval, to peer: LANPeer) -> Bool {
+        let playback = LANPlayback(serverID: session.item.serverID, itemID: session.item.id, sourceID: session.source?.id,
+                                   position: max(0, position))
+        return app.lanSync.handOff(playback, to: peer.id)
+    }
+
+    /// 另一台设备交过来的播放
+    func continuePlayback(_ playback: LANPlayback) {
+        #if os(macOS)
+        NSApp.activate()
+        #endif
+        if let download = app.downloads.completedRecord(for: playback.itemID) {
+            play(download.item, sourceID: playback.sourceID, startAt: playback.position)
+            return
+        }
+        guard let client = app.client(for: playback.serverID) else {
+            errorMessage = "这台设备上没有这个内容所在的服务器"
+            return
+        }
+        Task {
+            do {
+                let item = try await client.item(id: playback.itemID)
+                play(item, sourceID: playback.sourceID, startAt: playback.position)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func makeSession(for item: MediaItem, resume: Bool?, sourceID: String? = nil, startAt: TimeInterval? = nil) async throws -> PlaybackSession {
         let settings = app.settings
         let client = app.client(for: item.serverID)
         let playSessionID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
@@ -75,7 +114,7 @@ final class PlayerPresenter {
             let source = saved.mediaSources.first
             let native = source.map(PlaybackCompatibility.canPlayNatively) ?? false
             let engine: PlaybackEngineKind = settings.engine == .ffmpeg || !native ? .ffmpeg : .native
-            let start = startTime(for: saved, resume: resume)
+            let start = startAt ?? startTime(for: saved, resume: resume)
             let session = PlaybackSession(item: saved, source: source, url: localURL, headers: [:], engine: engine,
                                           externalSubtitles: [], startTime: start, isTranscoding: false, isOffline: true,
                                           playSessionID: playSessionID, client: client)
@@ -87,6 +126,13 @@ final class PlayerPresenter {
         }
 
         guard let client else { throw APIError.message("找不到该内容所属的服务器") }
+        let route = await ServerRoute.shared.resolve(
+            client.account.connectionURL,
+            timeout: client.account.advanced.timeout,
+            allowsInsecureTLS: client.account.advanced.allowsInsecureTLS,
+            alternates: client.account.backupLines.map(\.url)
+        )
+        MediaRequestAuth.register(route, headers: client.streamHeaders)
         var full = item
         if full.mediaSources.isEmpty {
             full = try await client.item(id: item.id)
@@ -100,14 +146,14 @@ final class PlayerPresenter {
         }
 
         let subtitles = source.externalSubtitles.map {
-            ExternalSubtitle(id: $0.id, name: $0.displayName, language: $0.language, url: $0.deliveryURL!,
+            ExternalSubtitle(id: $0.id, name: $0.displayName, language: $0.language, url: ServerEndpoint.redirect($0.deliveryURL!, through: route),
                              isDefault: $0.isDefault, isForced: $0.isForced)
         }
         let compatible = PlaybackCompatibility.canPlayNatively(source)
         let nativeFriendly = compatible && subtitles.isEmpty && !PlaybackCompatibility.hasUnsupportedSubtitles(source)
 
         var engine = PlaybackEngineKind.ffmpeg
-        var url = directURL
+        var url = ServerEndpoint.redirect(directURL, through: route)
         var transcoding = false
         switch settings.engine {
         case .ffmpeg:
@@ -119,13 +165,13 @@ final class PlayerPresenter {
                 engine = .native
             } else if client.supportsHLS, let hls = client.hlsURL(for: full, source: source, playSessionID: playSessionID) {
                 engine = .native
-                url = hls
+                url = ServerEndpoint.redirect(hls, through: route)
                 transcoding = true
             }
         }
 
         return PlaybackSession(item: full, source: source, url: url, headers: client.streamHeaders, engine: engine,
-                               externalSubtitles: engine == .ffmpeg ? subtitles : [], startTime: startTime(for: full, resume: resume),
+                               externalSubtitles: engine == .ffmpeg ? subtitles : [], startTime: startAt ?? startTime(for: full, resume: resume),
                                isTranscoding: transcoding, isOffline: false, playSessionID: playSessionID, client: client)
     }
 

@@ -30,6 +30,7 @@ if ! PROGRESS_FILES="$file_count" python3 scripts/progress.py compile "$build_lo
     -allowProvisioningUpdates \
     DEVELOPMENT_TEAM="$SIGN_TEAM" \
     PRODUCT_BUNDLE_IDENTIFIER="$SIGN_BUNDLE" \
+    CURRENT_PROJECT_VERSION="$(date +%y%m%d%H%M)" \
     CODE_SIGN_STYLE=Automatic \
     build
 then
@@ -64,5 +65,11 @@ fi
 rm -rf "$dest"
 ditto "$app" "$dest"
 echo "已安装到 ${dest}"
+
+# 编译目录里的副本也带同一个 Bundle ID。系统按 Bundle ID 读 Info.plist（比如局域网服务权限），
+# 只登记安装的这份，免得读到旧副本
+lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+"$lsregister" -u "$app" 2>/dev/null || true
+"$lsregister" -f "$dest" 2>/dev/null || true
 
 open "$dest"

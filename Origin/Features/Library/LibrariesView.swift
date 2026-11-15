@@ -4,22 +4,14 @@ struct LibrariesView: View {
     @Environment(AppModel.self) private var app
     @State private var libraries: [MediaLibrary] = []
     @State private var errorText: String?
-    @State private var partialError: String?
     @State private var isLoading = true
+    @State private var loadedRevision: Int?
 
     private let columns = [GridItem(.adaptive(minimum: 300), spacing: 16)]
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                if let partialError {
-                    Label(partialError, systemImage: "wifi.exclamationmark")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(.regularMaterial, in: .rect(cornerRadius: 12))
-                }
                 LazyVGrid(columns: columns, spacing: 16) {
                     ForEach(libraries) { library in
                         NavigationLink(value: Route.library(library)) {
@@ -52,13 +44,16 @@ struct LibrariesView: View {
             ToolbarItem(placement: .primaryAction) { ServerMenu() }
         }
         .refreshable { await load() }
-        .task { await load() }
+        .task(id: app.contentRevision) {
+            guard loadedRevision != app.contentRevision else { return }
+            loadedRevision = app.contentRevision
+            await load()
+        }
     }
 
     private func load() async {
         guard !app.homeAccounts.isEmpty else {
             libraries = []
-            partialError = nil
             errorText = nil
             isLoading = false
             return
@@ -67,7 +62,6 @@ struct LibrariesView: View {
         defer { isLoading = false }
         let result = await app.collectLibraries()
         libraries = result.libraries
-        partialError = result.libraries.isEmpty ? nil : result.failure.map { "有的服务器暂时连不上：\($0)" }
         errorText = result.libraries.isEmpty ? result.failure : nil
     }
 }
@@ -283,7 +277,6 @@ struct ItemsGridView: View {
                     guard let serverClient = app.client(for: account.id), serverClient.supportsFavorites else { continue }
                     if let page = try? await serverClient.favorites() { merged.append(contentsOf: page) }
                 }
-                if merged.isEmpty { merged = try await client.favorites() }
                 items = merged
                 total = items.count
                 return

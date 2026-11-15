@@ -10,7 +10,43 @@ final class PlexClient: MediaServerClient {
     var supportsHLS: Bool { true }
     var supportsLibraryQuery: Bool { true }
 
-    private var baseURL: URL { account.connectionURL }
+    private var baseURL: URL { ServerRoute.shared.cached(account.connectionURL) ?? account.connectionURL }
+
+    private var didFetchRemotes = false
+
+    private func withRoute<T>(_ body: () async throws -> T) async throws -> T {
+        let alternates = await remoteCandidates()
+        return try await ServerRoute.shared.perform(
+            stored: account.connectionURL,
+            timeout: account.advanced.timeout,
+            allowsInsecureTLS: account.advanced.allowsInsecureTLS,
+            alternates: alternates,
+            register: { url in
+                MediaRequestAuth.register(url, headers: self.streamHeaders)
+            },
+            body
+        )
+    }
+
+    /// Plex 云端保存了远程和中继地址。蜂窝网络下私网地址会被跳过，改试这些。
+    private func remoteCandidates() async -> [URL] {
+        if !didFetchRemotes, let token, let machine = account.machineID {
+            didFetchRemotes = true
+            let had = ServerRoute.shared.remembered(for: account.connectionURL).count
+            if let resources = try? await Self.servers(token: token),
+               let server = resources.first(where: { $0.clientIdentifier == machine }) {
+                for connection in server.connections {
+                    if let url = URL(string: connection.uri) {
+                        ServerRoute.shared.remember(url, for: account.connectionURL)
+                    }
+                }
+            }
+            if ServerRoute.shared.remembered(for: account.connectionURL).count != had {
+                ServerRoute.shared.invalidate(account.connectionURL)
+            }
+        }
+        return account.backupLines.map(\.url) + ServerRoute.shared.remembered(for: account.connectionURL)
+    }
 
     init(account: ServerAccount) {
         self.account = account
@@ -126,8 +162,10 @@ final class PlexClient: MediaServerClient {
     // MARK: - 请求
 
     private func container(_ path: String, _ query: [String: String?] = [:]) async throws -> PlexContainer {
-        let url = baseURL.appending(path: path, query: query)
-        return try await http.decode(PlexResponse.self, from: url, headers: headers).mediaContainer
+        try await withRoute {
+            let url = self.baseURL.appending(path: path, query: query)
+            return try await self.http.decode(PlexResponse.self, from: url, headers: self.headers).mediaContainer
+        }
     }
 
     private func metadata(_ path: String, _ query: [String: String?] = [:]) async throws -> [MediaItem] {
@@ -263,12 +301,16 @@ final class PlexClient: MediaServerClient {
 
     func setPlayed(_ played: Bool, item: MediaItem) async throws {
         let path = played ? "/:/scrobble" : "/:/unscrobble"
-        _ = try await http.data(baseURL.appending(path: path, query: ["identifier": "com.plexapp.plugins.library", "key": item.id]), headers: headers)
+        try await withRoute {
+            _ = try await self.http.data(self.baseURL.appending(path: path, query: ["identifier": "com.plexapp.plugins.library", "key": item.id]), headers: self.headers)
+        }
     }
 
     func setFavorite(_ favorite: Bool, item: MediaItem) async throws {
-        let url = baseURL.appending(path: "/library/metadata/\(item.id)", query: ["favorite": favorite ? "1" : "0"])
-        _ = try await http.data(url, method: "PUT", headers: headers)
+        try await withRoute {
+            let url = self.baseURL.appending(path: "/library/metadata/\(item.id)", query: ["favorite": favorite ? "1" : "0"])
+            _ = try await self.http.data(url, method: "PUT", headers: self.headers)
+        }
     }
 
     // MARK: - 播放
@@ -296,17 +338,19 @@ final class PlexClient: MediaServerClient {
     }
 
     private func timeline(_ report: PlaybackReport, state: String) async {
-        let url = baseURL.appending(path: "/:/timeline", query: [
-            "ratingKey": report.item.id,
-            "key": "/library/metadata/\(report.item.id)",
-            "state": state,
-            "time": "\(Int(report.position * 1000))",
-            "duration": "\(Int(report.duration * 1000))",
-            "playbackTime": "\(Int(report.position * 1000))",
-        ])
-        var headers = headers
-        headers["X-Plex-Session-Identifier"] = report.playSessionID
-        _ = try? await http.data(url, headers: headers)
+        _ = try? await withRoute {
+            let url = self.baseURL.appending(path: "/:/timeline", query: [
+                "ratingKey": report.item.id,
+                "key": "/library/metadata/\(report.item.id)",
+                "state": state,
+                "time": "\(Int(report.position * 1000))",
+                "duration": "\(Int(report.duration * 1000))",
+                "playbackTime": "\(Int(report.position * 1000))",
+            ])
+            var headers = self.headers
+            headers["X-Plex-Session-Identifier"] = report.playSessionID
+            return try await self.http.data(url, headers: headers)
+        }
     }
 
     func reportStart(_ report: PlaybackReport) async {

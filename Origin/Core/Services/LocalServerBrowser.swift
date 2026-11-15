@@ -6,7 +6,7 @@ import Observation
 /// 局域网中通过 Bonjour 广播的媒体服务器
 struct DiscoveredServer: Identifiable, Hashable {
     let id: String
-    let name: String
+    var name: String
     let kind: ServerKind
     /// 解析出的地址与端口，如 10.10.10.10:8005。IPv6 带方括号。解析完成前为空。
     var address: String
@@ -31,6 +31,10 @@ final class LocalServerBrowser {
     @ObservationIgnored private var probing: Set<String> = []
     /// 只撤销 Bonjour 发现的条目。UDP 广播用另一套标识，不能被 Bonjour 的刷新删掉。
     @ObservationIgnored private var bonjourIDs: Set<String> = []
+    @ObservationIgnored private var pathMonitor: NWPathMonitor?
+    /// 只有 Wi-Fi 或有线网能发现局域网服务器。蜂窝网络下不显示上次的结果。
+    @ObservationIgnored private var discoverable = false
+    @ObservationIgnored private var sawPath = false
 
     private static let serviceTypes: [(String, ServerKind)] = [
         ("_trim_media._tcp", .fnos),
@@ -38,10 +42,11 @@ final class LocalServerBrowser {
     ]
 
     func start() {
+        monitorPath()
         guard browseTasks.isEmpty else { return }
         isSearching = true
         session = UUID()
-        if servers.isEmpty { servers = Self.cachedServers() }
+        if discoverable, servers.isEmpty { showCached() }
         for (type, kind) in Self.serviceTypes {
             browseTasks.append(Task(priority: .userInitiated) { [weak self] in
                 await self?.browse(type: type, kind: kind)
@@ -85,6 +90,58 @@ final class LocalServerBrowser {
         isSearching = false
     }
 
+    private func monitorPath() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor in
+                self?.note(path)
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "origin.discovery-path"))
+    }
+
+    /// Wi-Fi 或网线断开后，附近列表立即清空，避免继续显示上次在局域网看到的服务器。
+    private func note(_ path: NWPath) {
+        let allowed = path.status == .satisfied && (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
+        if !sawPath {
+            sawPath = true
+            discoverable = allowed
+            if allowed {
+                if servers.isEmpty { showCached() }
+            } else {
+                hideDiscovered()
+            }
+            return
+        }
+        guard allowed != discoverable else { return }
+        discoverable = allowed
+        if !allowed {
+            hideDiscovered()
+            return
+        }
+        restart()
+    }
+
+    private func showCached() {
+        servers = Self.cachedServers()
+        for server in servers where !server.address.isEmpty {
+            refreshName(id: server.id, address: server.address)
+        }
+    }
+
+    private func hideDiscovered() {
+        session = UUID()
+        lookups.values.forEach { $0.cancel() }
+        lookups.removeAll()
+        pending.removeAll()
+        probing.removeAll()
+        bonjourIDs.removeAll()
+        servers.removeAll()
+        isSearching = false
+    }
+
     /// 必须离开主线程。nonisolated async 会沿用调用方的 MainActor，结果就会排在界面动画后面。
     @concurrent
     private func browse(type: String, kind: ServerKind) async {
@@ -106,6 +163,7 @@ final class LocalServerBrowser {
     }
 
     private func handle(_ found: [ServiceCandidate], kind: ServerKind) {
+        guard discoverable else { return }
         if !found.isEmpty {
             isSearching = false
             let alive = Set(found.map(\.instanceName))
@@ -166,6 +224,7 @@ final class LocalServerBrowser {
 
     /// UDP 广播的应答里已经带了地址。先确认它是 Jellyfin、Emby 还是飞牛，再放进列表。
     private func adopt(_ announcement: BroadcastAnnouncement) {
+        guard discoverable else { return }
         guard !DiscoveryAddress.same(announcement.address, in: servers, except: nil) else { return }
         guard probing.insert(announcement.id).inserted else { return }
         let token = session
@@ -174,25 +233,28 @@ final class LocalServerBrowser {
             await MainActor.run {
                 guard let self else { return }
                 self.probing.remove(announcement.id)
-                guard self.session == token, let (kind, info) = result else { return }
+                guard self.discoverable, self.session == token, let (kind, info) = result else { return }
                 guard !DiscoveryAddress.same(announcement.address, in: self.servers, except: nil) else { return }
                 let id = "\(kind.rawValue)|\(announcement.id)"
                 guard !self.servers.contains(where: { $0.id == id }) else { return }
                 let trimmed = announcement.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                let reported = info.serverName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let name = reported.isEmpty ? (trimmed.isEmpty ? kind.displayName : trimmed) : reported
                 self.servers.append(DiscoveredServer(
                     id: id,
-                    name: trimmed.isEmpty ? (info.serverName ?? kind.displayName) : trimmed,
+                    name: name,
                     kind: kind,
                     address: announcement.address,
                     instanceKey: announcement.id
                 ))
-                AddressCache.store(announcement.address, for: id)
+                AddressCache.store(announcement.address, name: name, for: id)
                 self.isSearching = false
             }
         }
     }
 
     private func reveal(_ id: String, address: String) {
+        guard discoverable else { return }
         guard let pending = pending.removeValue(forKey: id) else { return }
         lookups[id]?.cancel()
         lookups[id] = nil
@@ -204,8 +266,9 @@ final class LocalServerBrowser {
             address: address,
             instanceKey: pending.instanceKey
         ))
-        AddressCache.store(address, for: id)
+        AddressCache.store(address, name: pending.name, for: id)
         isSearching = false
+        refreshName(id: id, address: address)
     }
 
     /// 上次见过的服务器。打开页面时先显示，这一轮浏览用来确认它还在。
@@ -217,7 +280,7 @@ final class LocalServerBrowser {
             guard !DiscoveryAddress.same(address, in: seen, except: nil) else { continue }
             seen.append(DiscoveredServer(
                 id: id,
-                name: displayName(parts[1], kind: kind),
+                name: AddressCache.name(for: id) ?? displayName(parts[1], kind: kind),
                 kind: kind,
                 address: address,
                 instanceKey: parts[1]
@@ -236,6 +299,7 @@ final class LocalServerBrowser {
 
     /// 先到的地址先显示。IPv4 后到时替换 IPv6，因为登录地址用 IPv4 更直接。
     private func store(_ address: String, for id: String) {
+        guard discoverable else { return }
         guard let index = servers.firstIndex(where: { $0.id == id }) else { return }
         let current = servers[index].address
         if Self.isIPv4(current), !Self.isIPv4(address) { return }
@@ -247,7 +311,8 @@ final class LocalServerBrowser {
             return
         }
         servers[index].address = address
-        AddressCache.store(address, for: id)
+        AddressCache.store(address, name: servers[index].name, for: id)
+        refreshName(id: id, address: address)
         if Self.isIPv4(address) {
             lookups[id]?.cancel()
             lookups[id] = nil
@@ -256,6 +321,23 @@ final class LocalServerBrowser {
 
     private static func isIPv4(_ address: String) -> Bool {
         !address.isEmpty && !address.hasPrefix("[")
+    }
+
+    /// 广播里的名字带有图标前缀。连上后改用服务器自己报的名称。
+    private func refreshName(id: String, address: String) {
+        guard let url = URL(string: "http://\(address)") else { return }
+        let token = session
+        Task { [weak self] in
+            let result = try? await JellyfinClient.probe(baseURL: url, timeout: 2)
+            let reported = result?.1.serverName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !reported.isEmpty else { return }
+            await MainActor.run {
+                guard let self, self.session == token, self.discoverable else { return }
+                guard let index = self.servers.firstIndex(where: { $0.id == id }) else { return }
+                self.servers[index].name = reported
+                AddressCache.store(self.servers[index].address, name: reported, for: id)
+            }
+        }
     }
 
     private nonisolated static func candidates(in endpoints: [Bonjour.Endpoint]) -> [ServiceCandidate] {
@@ -305,6 +387,7 @@ private nonisolated enum BonjourInterface {
 /// 上次解析出的地址。服务名一到就先显示，不必再等这一轮的地址查询。
 private nonisolated enum AddressCache {
     private static let key = "origin.discoveredAddresses"
+    private static let nameKey = "origin.discoveredNames"
 
     static func saved() -> [String: String] {
         UserDefaults.standard.dictionary(forKey: key) as? [String: String] ?? [:]
@@ -314,11 +397,24 @@ private nonisolated enum AddressCache {
         saved()[id]
     }
 
-    static func store(_ address: String, for id: String) {
+    static func name(for id: String) -> String? {
+        let names = UserDefaults.standard.dictionary(forKey: nameKey) as? [String: String] ?? [:]
+        let name = names[id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return name.isEmpty ? nil : name
+    }
+
+    static func store(_ address: String, name: String? = nil, for id: String) {
         var map = UserDefaults.standard.dictionary(forKey: key) as? [String: String] ?? [:]
-        guard map[id] != address else { return }
-        map[id] = address
-        UserDefaults.standard.set(map, forKey: key)
+        if map[id] != address {
+            map[id] = address
+            UserDefaults.standard.set(map, forKey: key)
+        }
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return }
+        var names = UserDefaults.standard.dictionary(forKey: nameKey) as? [String: String] ?? [:]
+        guard names[id] != trimmed else { return }
+        names[id] = trimmed
+        UserDefaults.standard.set(names, forKey: nameKey)
     }
 }
 

@@ -77,6 +77,7 @@ if ! PROGRESS_FILES="$file_count" python3 scripts/progress.py compile "$build_lo
     -allowProvisioningUpdates \
     DEVELOPMENT_TEAM="$SIGN_TEAM" \
     PRODUCT_BUNDLE_IDENTIFIER="$SIGN_BUNDLE" \
+    CURRENT_PROJECT_VERSION="$(date +%y%m%d%H%M)" \
     CODE_SIGN_STYLE=Automatic \
     build
 then
@@ -103,6 +104,8 @@ then
     exit 1
 fi
 rm -f "$install_log"
+# 编译出来的 .app 会被系统登记成 Mac 上的应用，出现在启动台里
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$app" 2>/dev/null || true
 
 profile=$(find "$app" -name embedded.mobileprovision -print -quit)
 if [[ -n $profile ]]; then

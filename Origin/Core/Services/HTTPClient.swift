@@ -1,4 +1,6 @@
+import CFNetwork
 import Foundation
+import Security
 
 nonisolated enum APIError: LocalizedError {
     case invalidURL
@@ -24,22 +26,26 @@ nonisolated enum APIError: LocalizedError {
 nonisolated struct HTTPClient {
     var session: URLSession
     var timeout: TimeInterval
-    /// 自定义会话会持有这个委托，否则自签名证书的回调会被释放
-    private let tlsKeeper: InsecureTLSDelegate?
+    /// 自定义会话会持有这个委托，否则证书回调会被释放
+    private let tlsKeeper: OriginTrustDelegate
+    /// 连到已经选定的 IP 时不走系统代理，避免代理把真实地址再送进虚拟网卡。
+    private let directSession: URLSession
 
     init(timeout: TimeInterval = 20, allowsInsecureTLS: Bool = false) {
         self.timeout = timeout
-        if allowsInsecureTLS {
-            let delegate = InsecureTLSDelegate()
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = timeout
-            configuration.timeoutIntervalForResource = timeout
-            tlsKeeper = delegate
-            session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
-        } else {
-            tlsKeeper = nil
-            session = .shared
-        }
+        let delegate = OriginTrustDelegate(allowsInsecure: allowsInsecureTLS)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = timeout
+        configuration.timeoutIntervalForResource = timeout
+        configuration.waitsForConnectivity = false
+        tlsKeeper = delegate
+        session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        let direct = configuration.copy() as? URLSessionConfiguration ?? URLSessionConfiguration.ephemeral
+        direct.timeoutIntervalForRequest = timeout
+        direct.timeoutIntervalForResource = timeout
+        direct.waitsForConnectivity = false
+        direct.connectionProxyDictionary = OriginTrust.directProxySettings()
+        directSession = URLSession(configuration: direct, delegate: delegate, delegateQueue: nil)
     }
 
     func data(
@@ -57,7 +63,11 @@ nonisolated struct HTTPClient {
         if body != nil, request.value(forHTTPHeaderField: "Content-Type") == nil {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
-        let (data, response) = try await session.data(for: request)
+        if let authority = ServerEndpoint.authority(for: url) {
+            request.setValue(authority, forHTTPHeaderField: "Host")
+        }
+        let transport = ServerEndpoint.bypassesProxy(url) ? directSession : session
+        let (data, response) = try await transport.data(for: request)
         guard let http = response as? HTTPURLResponse else { return data }
         switch http.statusCode {
         case 200 ..< 300: return data
@@ -111,14 +121,86 @@ extension String {
     }
 }
 
-/// 接受自签名证书。只在用户打开“允许自签名证书”后使用。
-nonisolated final class InsecureTLSDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
-    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+/// 用户允许自签名时直接接受证书。连到字面 IP 时可按原来的域名校验。
+nonisolated enum OriginTrust {
+    /// 关掉系统 HTTP、HTTPS、SOCKS 和 PAC。只用于用户填写的字面 IP。
+    static func directProxySettings() -> [String: Any] {
+        var settings: [String: Any] = [
+            kCFNetworkProxiesHTTPEnable as String: 0,
+            kCFNetworkProxiesProxyAutoConfigEnable as String: 0,
+        ]
+        #if os(macOS)
+        settings[kCFNetworkProxiesHTTPSEnable as String] = 0
+        settings[kCFNetworkProxiesSOCKSEnable as String] = 0
+        #endif
+        return settings
+    }
+
+    static let session: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = false
+        return URLSession(configuration: configuration, delegate: OriginTrustDelegate(allowsInsecure: false), delegateQueue: nil)
+    }()
+
+    private static let directSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = false
+        configuration.connectionProxyDictionary = directProxySettings()
+        return URLSession(configuration: configuration, delegate: OriginTrustDelegate(allowsInsecure: false), delegateQueue: nil)
+    }()
+
+    static func session(for url: URL) -> URLSession {
+        ServerEndpoint.isLiteralIP(url.host() ?? "") ? directSession : session
+    }
+
+    static func evaluate(_ challenge: URLAuthenticationChallenge, allowsInsecure: Bool) -> (URLSession.AuthChallengeDisposition, URLCredential?) {
         guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
               let trust = challenge.protectionSpace.serverTrust else {
             return (.performDefaultHandling, nil)
         }
-        return (.useCredential, URLCredential(trust: trust))
+        if allowsInsecure {
+            return (.useCredential, URLCredential(trust: trust))
+        }
+        if let domain = ServerRoute.shared.certificateHost(for: challenge.protectionSpace.host) {
+            SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, domain as CFString))
+            if SecTrustEvaluateWithError(trust, nil) {
+                return (.useCredential, URLCredential(trust: trust))
+            }
+            return (.cancelAuthenticationChallenge, nil)
+        }
+        return (.performDefaultHandling, nil)
+    }
+
+    /// 收到响应头就算这条地址通了。
+    static func responds(_ url: URL, timeout: TimeInterval, allowsInsecure: Bool, direct: Bool) async -> Bool {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = timeout
+        configuration.timeoutIntervalForResource = timeout
+        configuration.waitsForConnectivity = false
+        if direct { configuration.connectionProxyDictionary = directProxySettings() }
+        let session = URLSession(configuration: configuration, delegate: OriginTrustDelegate(allowsInsecure: allowsInsecure), delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        if let authority = ServerEndpoint.authority(for: url) {
+            request.setValue(authority, forHTTPHeaderField: "Host")
+        }
+        guard let (bytes, response) = try? await session.bytes(for: request) else { return false }
+        bytes.task.cancel()
+        return response is HTTPURLResponse
+    }
+}
+
+nonisolated final class OriginTrustDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
+    let allowsInsecure: Bool
+
+    init(allowsInsecure: Bool) {
+        self.allowsInsecure = allowsInsecure
+    }
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        OriginTrust.evaluate(challenge, allowsInsecure: allowsInsecure)
     }
 }
 

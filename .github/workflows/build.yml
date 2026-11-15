@@ -1,0 +1,71 @@
+name: 构建
+
+# 推送到 main 时更新“最新构建”预发布版；推送 v 开头的标签时发正式版。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 选择 Xcode 26
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -n 1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+
+      - name: 缓存依赖
+        uses: actions/cache@v4
+        with:
+          path: Vendor
+          key: vendor-${{ hashFiles('scripts/bootstrap.sh', 'scripts/fix-ffmpegkit-macos.sh', 'patches/**') }}
+
+      - name: 准备依赖和工程
+        env:
+          TMDB_READ_TOKEN: ${{ secrets.TMDB_READ_TOKEN }}
+        run: |
+          brew install xcodegen
+          scripts/bootstrap.sh
+          if [ -n "$TMDB_READ_TOKEN" ]; then
+            printf 'TMDB_READ_TOKEN = %s\n' "$TMDB_READ_TOKEN" > Config/Secrets.xcconfig
+          fi
+
+      - name: 编译 iPhone 版
+        run: BUILD_NUMBER=${{ github.run_number }} scripts/ci-build.sh ios
+
+      - name: 编译 Mac 版
+        run: BUILD_NUMBER=${{ github.run_number }} scripts/ci-build.sh mac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Origin-${{ github.run_number }}
+          path: build/dist/*
+
+      - name: 发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="iPhone / iPad：Origin-iOS.ipa 未签名，用爱思助手、Sideloadly 或 AltStore 签名安装。
+          Mac：解压 Origin-macOS.zip，把 Origin 拖进“应用程序”。第一次打开如果被拦，到“系统设置 → 隐私与安全性”点“仍要打开”。"
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            gh release create "$GITHUB_REF_NAME" build/dist/* --title "Origin $GITHUB_REF_NAME" --notes "$notes"
+          else
+            gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+            gh release create nightly build/dist/* --prerelease --target "$GITHUB_SHA" \
+              --title "最新构建 #${{ github.run_number }}" --notes "$notes
+
+          对应提交：${GITHUB_SHA::7}"
+          fi

@@ -174,6 +174,7 @@ final class CloudSync: NSObject {
     }
 
     func pushSetting(key: String, value: Any, updatedAt: Date) {
+        localChangeHandler?()
         guard enabled else { return }
         pendingSettings[key] = (value, updatedAt)
         flushTask?.cancel()
@@ -184,9 +185,10 @@ final class CloudSync: NSObject {
     }
 
     func upsert(_ account: ServerAccount) {
-        guard enabled else { return }
         let now = Date()
         setAccountStamp(now, for: account.id)
+        localChangeHandler?()
+        guard enabled else { return }
         guard usesKeyValueStore else {
             reconcileKeychain()
             return
@@ -196,9 +198,10 @@ final class CloudSync: NSObject {
     }
 
     func delete(_ id: UUID) {
-        guard enabled else { return }
         let now = Date()
         setAccountStamp(now, for: id)
+        localChangeHandler?()
+        guard enabled else { return }
         guard usesKeyValueStore else {
             reconcileKeychain()
             return
@@ -208,13 +211,16 @@ final class CloudSync: NSObject {
     }
 
     func noteOrderChanged() {
-        guard enabled, let app else { return }
+        guard let app else { return }
+        let now = Date()
+        defaults.set(now.timeIntervalSince1970, forKey: Self.orderStampKey)
+        localChangeHandler?()
+        guard enabled else { return }
         guard usesKeyValueStore else {
-            writeOrder(app.accounts.map(\.id), updatedAt: Date())
             reconcileKeychain()
             return
         }
-        writeOrder(app.accounts.map(\.id), updatedAt: Date())
+        writeOrder(app.accounts.map(\.id), updatedAt: now)
         store.synchronize()
     }
 
@@ -359,8 +365,9 @@ final class CloudSync: NSObject {
         if let orderUpdatedAt = plan.orderUpdatedAt {
             defaults.set(orderUpdatedAt.timeIntervalSince1970, forKey: Self.orderStampKey)
         }
-        if plan.accounts != app.accounts {
-            app.replaceAccountsFromSync(plan.accounts)
+        let merged = keepingLocalLines(plan.accounts)
+        if merged != app.accounts {
+            app.replaceAccountsFromSync(merged)
         }
         for envelope in plan.uploads {
             write(envelope)
@@ -417,9 +424,76 @@ final class CloudSync: NSObject {
 
     /// 把另一台设备通过 iCloud 钥匙串送来的记录和本机合并，再写回同一条钥匙串。
     private func reconcileKeychain() {
-        guard enabled, let app else { return }
-        let settings = app.settings
+        guard enabled, app != nil else { return }
         let blob = loadKeychainBlob()
+        let remoteItems = merge(blob)
+        var deviceMap = Dictionary(uniqueKeysWithValues: (blob?.devices ?? []).map { ($0.id, $0) })
+        let me = SyncDevice(id: DeviceInfo.deviceID, name: DeviceInfo.deviceName, kind: Self.thisKind, seen: Date())
+        deviceMap[me.id] = me
+        let cutoff = Date().addingTimeInterval(-90 * 24 * 60 * 60)
+        devices = deviceMap.values.filter { $0.seen > cutoff }.sorted { $0.seen > $1.seen }
+        guard let outgoing = makeBlob(keeping: remoteItems, devices: devices), let data = try? encoder.encode(outgoing) else {
+            keychainWriteOK = false
+            return
+        }
+        keychainWriteOK = Keychain.setData(data, for: Self.keychainBlobKey, synchronizable: true)
+        // 服务器资料在同步包里，登录令牌是另一条钥匙串。合并账号后要把令牌取回本机，否则请求不带 Token。
+        pullSecrets()
+    }
+
+    // MARK: - 局域网
+
+    /// 本机的服务器、设置或顺序改动后调用，局域网同步据此把最新状态推给已连上的设备。
+    @ObservationIgnored var localChangeHandler: (() -> Void)?
+
+    /// 发给局域网里另一台设备的整包：服务器、顺序、设置，以及各服务器的登录令牌。
+    func peerPayload() -> Data? {
+        guard let app else { return nil }
+        // 以前没开同步时加的服务器没有时间戳。按最旧算，免得每次发包都像刚改过、盖掉对方更新的版本。
+        let oldest = Date(timeIntervalSince1970: 1)
+        var stamps = accountStamps()
+        if app.accounts.contains(where: { stamps[$0.id] == nil }) {
+            for account in app.accounts where stamps[account.id] == nil { stamps[account.id] = oldest }
+            saveAccountStamps(stamps)
+        }
+        if defaults.object(forKey: Self.orderStampKey) == nil {
+            defaults.set(oldest.timeIntervalSince1970, forKey: Self.orderStampKey)
+        }
+        guard let blob = makeBlob(keeping: [], devices: []) else { return nil }
+        var tokens: [UUID: String] = [:]
+        for account in app.accounts {
+            if let token = account.token { tokens[account.id] = token }
+        }
+        let tmdb = app.settings.customTMDBToken
+        return try? encoder.encode(PeerPayload(blob: blob, tokens: tokens, tmdbToken: tmdb.isEmpty ? nil : tmdb))
+    }
+
+    /// 合并另一台设备送来的整包。令牌跟着服务器记录走：本机没有，或对方那条记录更新时才换。
+    func applyPeerPayload(_ data: Data) {
+        guard let app, let payload = try? decoder.decode(PeerPayload.self, from: data) else { return }
+        let before = accountStamps()
+        merge(payload.blob)
+        for envelope in payload.blob.accounts where !envelope.isDeleted {
+            guard let token = payload.tokens[envelope.id], app.accounts.contains(where: { $0.id == envelope.id }) else { continue }
+            let local = Keychain.string(for: envelope.id.uuidString)
+            guard local != token else { continue }
+            let newer = envelope.updatedAt.timeIntervalSince(before[envelope.id] ?? .distantPast) > 0.001
+            guard local == nil || newer else { continue }
+            Keychain.set(token, for: envelope.id.uuidString, synchronizable: enabled)
+            app.refreshClient(for: envelope.id)
+        }
+        if let tmdb = payload.tmdbToken, app.settings.customTMDBToken.isEmpty {
+            app.settings.applyRemoteTMDBToken(tmdb)
+            app.refreshTMDB()
+        }
+        if enabled, !usesKeyValueStore { reconcileKeychain() }
+    }
+
+    /// 设置按各自的时间戳取新，服务器交给 AccountSyncPlanner。返回对方的服务器记录，打包时要带上对方的删除记录。
+    @discardableResult
+    private func merge(_ blob: KeychainSyncBlob?) -> [RemoteAccountState] {
+        guard let app else { return [] }
+        let settings = app.settings
         if let blob {
             for (key, record) in blob.settings {
                 let local = settings.localStamp(for: key) ?? .distantPast
@@ -448,24 +522,40 @@ final class CloudSync: NSObject {
         if let orderUpdatedAt = plan.orderUpdatedAt {
             defaults.set(orderUpdatedAt.timeIntervalSince1970, forKey: Self.orderStampKey)
         }
-        if plan.accounts != app.accounts {
-            app.replaceAccountsFromSync(plan.accounts)
+        let merged = keepingLocalLines(plan.accounts)
+        if merged != app.accounts {
+            app.replaceAccountsFromSync(merged)
         }
-        var deviceMap = Dictionary(uniqueKeysWithValues: (blob?.devices ?? []).map { ($0.id, $0) })
-        let me = SyncDevice(id: DeviceInfo.deviceID, name: DeviceInfo.deviceName, kind: Self.thisKind, seen: Date())
-        deviceMap[me.id] = me
-        let cutoff = Date().addingTimeInterval(-90 * 24 * 60 * 60)
-        devices = deviceMap.values.filter { $0.seen > cutoff }.sorted { $0.seen > $1.seen }
+        return remoteItems
+    }
 
+    /// 当前线路是每台设备按自己的网络测出来的，留用本机的。否则一台在家一台在外，两边会来回改写对方。
+    private func keepingLocalLines(_ accounts: [ServerAccount]) -> [ServerAccount] {
+        guard let app else { return accounts }
+        var merged = accounts
+        for index in merged.indices {
+            guard let local = app.accounts.first(where: { $0.id == merged[index].id }),
+                  local.activeLineID != merged[index].activeLineID else { continue }
+            if local.activeLineID == nil || merged[index].backupLines.contains(where: { $0.id == local.activeLineID }) {
+                merged[index].activeLineID = local.activeLineID
+            }
+        }
+        return merged
+    }
+
+    private func makeBlob(keeping remoteItems: [RemoteAccountState], devices: [SyncDevice]) -> KeychainSyncBlob? {
+        guard let app else { return nil }
+        let settings = app.settings
         var settingsOut: [String: KeychainSetting] = [:]
         for (key, value) in settings.syncSnapshot() {
             guard let stamp = settings.localStamp(for: key) else { continue }
             settingsOut[key] = KeychainSetting(updatedAt: stamp, value: value)
         }
+        let stamps = accountStamps()
         var envelopes = app.accounts.map { account in
-            AccountEnvelope(id: account.id, updatedAt: accountStamps()[account.id] ?? Date(), isDeleted: false, account: account)
+            AccountEnvelope(id: account.id, updatedAt: stamps[account.id] ?? Date(), isDeleted: false, account: account)
         }
-        for (id, stamp) in accountStamps() where !app.accounts.contains(where: { $0.id == id }) {
+        for (id, stamp) in stamps where !app.accounts.contains(where: { $0.id == id }) {
             envelopes.append(AccountEnvelope(id: id, updatedAt: stamp, isDeleted: true, account: nil))
         }
         for item in remoteItems where item.isDeleted && !envelopes.contains(where: { $0.id == item.id }) {
@@ -475,14 +565,7 @@ final class CloudSync: NSObject {
             updatedAt: AppSettings.date(defaults.object(forKey: Self.orderStampKey)) ?? Date(),
             ids: app.accounts.map(\.id)
         )
-        let outgoing = KeychainSyncBlob(accounts: envelopes, order: order, settings: settingsOut, devices: devices)
-        if let data = try? encoder.encode(outgoing) {
-            keychainWriteOK = Keychain.setData(data, for: Self.keychainBlobKey, synchronizable: true)
-        } else {
-            keychainWriteOK = false
-        }
-        // 服务器资料在同步包里，登录令牌是另一条钥匙串。合并账号后要把令牌取回本机，否则请求不带 Token。
-        pullSecrets()
+        return KeychainSyncBlob(accounts: envelopes, order: order, settings: settingsOut, devices: devices)
     }
 
     private func loadKeychainBlob() -> KeychainSyncBlob? {
@@ -561,7 +644,7 @@ final class CloudSync: NSObject {
         .sorted { $0.seen > $1.seen }
     }
 
-    private static var thisKind: String {
+    static var thisKind: String {
         #if os(macOS)
         "mac"
         #else
@@ -727,6 +810,12 @@ private struct KeychainSyncBlob: Codable {
     var order: OrderEnvelope?
     var settings: [String: KeychainSetting]
     var devices: [SyncDevice]
+}
+
+private struct PeerPayload: Codable {
+    var blob: KeychainSyncBlob
+    var tokens: [UUID: String]
+    var tmdbToken: String?
 }
 
 private struct KeychainSetting: Codable {

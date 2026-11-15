@@ -183,6 +183,10 @@ final class DownloadManager: NSObject {
 }
 
 extension DownloadManager: URLSessionDownloadDelegate {
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        OriginTrust.evaluate(challenge, allowsInsecure: false)
+    }
+
     nonisolated func urlSession(_: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let id = downloadTask.taskDescription else { return }
         // 系统会在回调返回后删除临时文件，必须同步移动

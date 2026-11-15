@@ -75,11 +75,12 @@ targets:
           - fetch
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-          NSAllowsLocalNetworking: true
-        NSLocalNetworkUsageDescription: Origin 需要访问本地网络，以发现并连接局域网中的飞牛影视、Emby、Jellyfin 或 Plex 媒体服务器。
+        NSLocalNetworkUsageDescription: Origin 需要访问本地网络，以发现并连接局域网中的飞牛影视、Emby、Jellyfin 或 Plex 媒体服务器，并和同一网络里的其他设备同步服务器与设置。
         NSBonjourServices:
           - _trim_media._tcp
           - _plexmediasvr._tcp
+          - _originsync._tcp
+          - _originpair._tcp
         LSApplicationQueriesSchemes:
           - youtube
         UIFileSharingEnabled: true
@@ -153,11 +154,12 @@ targets:
         LSApplicationCategoryType: public.app-category.entertainment
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-          NSAllowsLocalNetworking: true
-        NSLocalNetworkUsageDescription: Origin 需要访问本地网络，以发现并连接局域网中的飞牛影视、Emby、Jellyfin 或 Plex 媒体服务器。
+        NSLocalNetworkUsageDescription: Origin 需要访问本地网络，以发现并连接局域网中的飞牛影视、Emby、Jellyfin 或 Plex 媒体服务器，并和同一网络里的其他设备同步服务器与设置。
         NSBonjourServices:
           - _trim_media._tcp
           - _plexmediasvr._tcp
+          - _originsync._tcp
+          - _originpair._tcp
         ITSAppUsesNonExemptEncryption: false
         TMDBReadToken: $(TMDB_READ_TOKEN)
         NSFaceIDUsageDescription: Origin 会在你打开已加密的服务器前，用触控 ID 确认是你本人。

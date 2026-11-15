@@ -8,3 +8,4 @@ Origin.xcodeproj/
 Config/Secrets.xcconfig
 Config/Signing.local
 Vendor/
+.cursor/*.log

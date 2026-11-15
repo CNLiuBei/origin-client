@@ -66,6 +66,7 @@ struct MacRootView: View {
         } message: {
             Text(player.errorMessage ?? "")
         }
+        .lanPairRequestAlert()
         .onAppear {
             app.player.windowActions = (
                 open: { openWindow(id: PlayerWindowView.id) },

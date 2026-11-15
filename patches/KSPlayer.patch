@@ -1,0 +1,238 @@
+--- a/Sources/KSPlayer/AVPlayer/KSPlayerLayer.swift	2026-11-15 18:36:28
++++ b/Sources/KSPlayer/AVPlayer/KSPlayerLayer.swift	2026-11-15 18:34:38
+@@ -73,24 +73,41 @@
+     @Published
+     public var isPipActive = false {
+         didSet {
++            guard isPipActive != oldValue else { return }
+             if #available(tvOS 14.0, *) {
+                 guard let pipController = player.pipController else {
++                    isPipActive = false
+                     return
+                 }
+ 
+                 if isPipActive {
++                    // 画中画窗口按视频比例显示，填充模式会把画面裁掉，期间强制等比
++                    contentModeBeforePip = player.contentMode
++                    player.contentMode = .scaleAspectFit
++                    #if os(macOS)
++                    ((player as? KSMEPlayer)?.videoOutput as? MetalPlayView)?.followPictureInPictureWindow(true)
++                    #endif
+                     // 一定要async才不会pip之后就暂停播放
+                     DispatchQueue.main.async { [weak self] in
+                         guard let self else { return }
+                         pipController.start(view: self)
+                     }
+                 } else {
++                    #if os(macOS)
++                    ((player as? KSMEPlayer)?.videoOutput as? MetalPlayView)?.followPictureInPictureWindow(false)
++                    #endif
++                    if let contentModeBeforePip {
++                        player.contentMode = contentModeBeforePip
++                        self.contentModeBeforePip = nil
++                    }
+                     pipController.stop(restoreUserInterface: true)
+                 }
+             }
+         }
+     }
+ 
++    private var contentModeBeforePip: UIViewContentMode?
++
+     public private(set) var options: KSOptions
+ 
+     public var player: MediaPlayerProtocol {
+@@ -181,9 +198,8 @@
+             // 一个兜底保护，正常不能走到这里
+             self.state = .bufferFinished
+         }
+-        if self.player.isPlaying {
+-            MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime] = self.player.currentPlaybackTime
+-        }
++        // 不在定时器里写 ElapsedPlaybackTime。系统会用 elapsed + playbackRate 自己走进度，
++        // 每 0.1 秒覆盖一次会让锁屏进度条抖动。播放、暂停、跳转时再写一次。
+     }
+ 
+     private var urls = [URL]()
+@@ -299,6 +315,8 @@
+         }
+         state = player.loadState == .playable ? .bufferFinished : .buffering
+         MPNowPlayingInfoCenter.default().playbackState = .playing
++        let nominalRate = player.playbackRate > 0 ? Double(player.playbackRate) : 1
++        publishNowPlayingClock(rate: nominalRate)
+         if #available(tvOS 14.0, *) {
+             KSPictureInPictureController.mute()
+         }
+@@ -310,6 +328,7 @@
+         timer.fireDate = Date.distantFuture
+         state = .paused
+         MPNowPlayingInfoCenter.default().playbackState = .paused
++        publishNowPlayingClock(rate: 0)
+         runOnMainThread {
+             UIApplication.shared.isIdleTimerDisabled = false
+         }
+@@ -338,6 +357,8 @@
+                 guard let self else { return }
+                 if finished, autoPlay {
+                     self.play()
++                } else if finished {
++                    self.publishNowPlayingClock(rate: 0)
+                 }
+                 completion(finished)
+             }
+@@ -475,11 +496,21 @@
+ extension KSPlayerLayer: AVPictureInPictureControllerDelegate {
+     public func pictureInPictureControllerDidStopPictureInPicture(_: AVPictureInPictureController) {
+         player.pipController?.stop(restoreUserInterface: false)
++        // 用户点画中画窗口的关闭按钮时不会走恢复回调，这里同步状态，否则下次要点两次才能再进入
++        isPipActive = false
+     }
+ 
+-    public func pictureInPictureController(_: AVPictureInPictureController, restoreUserInterfaceForPictureInPictureStopWithCompletionHandler _: @escaping (Bool) -> Void) {
++    public func pictureInPictureController(_: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
++        KSLog("[video] 画中画启动失败 \(error)")
+         isPipActive = false
+     }
++
++    public func pictureInPictureController(_: AVPictureInPictureController, restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
++        isPipActive = false
++        // 系统等这个回调才收起画中画窗口，不调用的话画中画一直退不出去。
++        // 稍等一下，让播放窗口先回到屏幕上，画面缩回去时有落点。
++        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { completionHandler(true) }
++    }
+ }
+ 
+ // MARK: - private functions
+@@ -490,6 +521,20 @@
+         startTime = CACurrentMediaTime()
+         bufferedCount = 0
+         player.prepareToPlay()
++    }
++
++    /// 只在播放、暂停、跳转时写入进度。iOS 认 `playbackRate`，不认 macOS 的 `playbackState`。
++    func publishNowPlayingClock(rate: Double) {
++        let elapsed = player.currentPlaybackTime
++        guard elapsed.isFinite else { return }
++        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
++        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsed
++        info[MPNowPlayingInfoPropertyPlaybackRate] = rate
++        let total = player.duration
++        if total.isFinite, total > 0 {
++            info[MPMediaItemPropertyPlaybackDuration] = total
++        }
++        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+     }
+ 
+     private func updateNowPlayingInfo() {
+--- a/Sources/KSPlayer/MEPlayer/MetalPlayView.swift	2026-11-15 18:36:28
++++ b/Sources/KSPlayer/MEPlayer/MetalPlayView.swift	2026-11-14 19:41:51
+@@ -99,27 +99,86 @@
+     override public func didAddSubview(_ subview: UIView) {
+         super.didAddSubview(subview)
+         subview.translatesAutoresizingMaskIntoConstraints = false
+-        NSLayoutConstraint.activate([
++        let constraints = [
+             subview.leftAnchor.constraint(equalTo: leftAnchor),
+             subview.topAnchor.constraint(equalTo: topAnchor),
+             subview.bottomAnchor.constraint(equalTo: bottomAnchor),
+             subview.rightAnchor.constraint(equalTo: rightAnchor),
+-        ])
++        ]
++        NSLayoutConstraint.activate(constraints)
++        if subview === displayView {
++            displayConstraints = constraints
++            #if os(macOS)
++            applyPictureInPictureSize()
++            #endif
++        }
+     }
+ 
++    private var displayConstraints: [NSLayoutConstraint] = []
++
++    #if os(macOS)
++    private var pipObservers: [NSObjectProtocol] = []
++    private var pipSize: CGSize? {
++        didSet { applyPictureInPictureSize() }
++    }
++
++    /// macOS 的画中画窗口用 CALayerHost 按 1:1 像素镜像 displayLayer，不会做缩放，
++    /// 只能让 displayLayer 的尺寸跟随画中画窗口，否则画面只显示左下角一块且不随窗口缩放
++    public func followPictureInPictureWindow(_ follow: Bool) {
++        pipObservers.forEach(NotificationCenter.default.removeObserver)
++        pipObservers = []
++        guard follow else {
++            pipSize = nil
++            return
++        }
++        let center = NotificationCenter.default
++        for name in [NSWindow.didResizeNotification, NSWindow.didUpdateNotification, NSWindow.didChangeScreenNotification] {
++            pipObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
++                guard let window = note.object as? NSWindow else { return }
++                MainActor.assumeIsolated { self?.syncPictureInPicture(window: window) }
++            })
++        }
++        NSApp.windows.forEach(syncPictureInPicture)
++    }
++
++    private func syncPictureInPicture(window: NSWindow) {
++        guard window !== self.window, String(describing: type(of: window)).contains("PIP"), window.isVisible else { return }
++        let size = window.contentLayoutRect.size
++        guard size.width > 1, size.height > 1 else { return }
++        let sourceScale = self.window?.backingScaleFactor ?? 1
++        let scale = window.backingScaleFactor / sourceScale
++        let target = CGSize(width: (size.width * scale).rounded(), height: (size.height * scale).rounded())
++        if target != pipSize { pipSize = target }
++    }
++
++    private func applyPictureInPictureSize() {
++        if let pipSize {
++            NSLayoutConstraint.deactivate(displayConstraints)
++            displayView.translatesAutoresizingMaskIntoConstraints = true
++            displayView.frame = CGRect(origin: .zero, size: pipSize)
++        } else if !displayConstraints.isEmpty, displayView.translatesAutoresizingMaskIntoConstraints {
++            displayView.translatesAutoresizingMaskIntoConstraints = false
++            NSLayoutConstraint.activate(displayConstraints)
++        }
++    }
++    #endif
++
++    private var displayGravity = AVLayerVideoGravity.resizeAspect
++
+     override public var contentMode: UIViewContentMode {
+         didSet {
+             metalView.contentMode = contentMode
+             switch contentMode {
+             case .scaleToFill:
+-                displayView.displayLayer.videoGravity = .resize
++                displayGravity = .resize
+             case .scaleAspectFit, .center:
+-                displayView.displayLayer.videoGravity = .resizeAspect
++                displayGravity = .resizeAspect
+             case .scaleAspectFill:
+-                displayView.displayLayer.videoGravity = .resizeAspectFill
++                displayGravity = .resizeAspectFill
+             default:
+                 break
+             }
++            displayView.displayLayer.videoGravity = displayGravity
+         }
+     }
+ 
+@@ -152,6 +211,9 @@
+ 
+     public func invalidate() {
+         displayLink.invalidate()
++        #if os(macOS)
++        followPictureInPictureWindow(false)
++        #endif
+     }
+ 
+     public func readNextFrame() {
+@@ -226,6 +288,7 @@
+             if formatDescription != nil {
+                 displayView.removeFromSuperview()
+                 displayView = AVSampleBufferDisplayView()
++                displayView.displayLayer.videoGravity = displayGravity
+                 displayView.frame = frame
+                 addSubview(displayView)
+             }

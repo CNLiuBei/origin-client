@@ -13,8 +13,10 @@ struct HomeView: View {
     @State private var libraries: [MediaLibrary] = []
     @State private var isLoading = true
     @State private var errorText: String?
-    @State private var partialError: String?
     @State private var loadedRevision: Int?
+    /// 每台服务器各自的结果。哪台先回来先显示，连不上的那台不会挡住别的。
+    @State private var contents: [UUID: ServerContent] = [:]
+    @State private var loadID = 0
 
     struct LibraryShelf: Identifiable {
         let library: MediaLibrary
@@ -22,18 +24,18 @@ struct HomeView: View {
         var id: String { library.id }
     }
 
+    private struct ServerContent {
+        var libraries: [MediaLibrary] = []
+        var shelves: [LibraryShelf] = []
+        var resume: [MediaItem] = []
+        var nextUp: [MediaItem] = []
+        var favorites: [MediaItem] = []
+        var failure: String?
+    }
+
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 28) {
-                if let partialError {
-                    Label(partialError, systemImage: "wifi.exclamationmark")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(.regularMaterial, in: .rect(cornerRadius: 12))
-                        .padding(.horizontal)
-                }
                 if !featured.isEmpty {
                     FeaturedCarousel(items: featured, selection: $featuredSelection)
                 }
@@ -162,53 +164,74 @@ struct HomeView: View {
 
     private func load() async {
         let accounts = app.homeAccounts
+        loadID += 1
         guard !accounts.isEmpty else {
+            contents = [:]
+            apply(order: [])
             isLoading = false
-            partialError = nil
             return
         }
+        let current = loadID
         isLoading = true
-        defer { isLoading = false }
+        let order = accounts.map(\.id)
+        contents = contents.filter { order.contains($0.key) }
+        apply(order: order)
         let prefixNames = accounts.count > 1
-        var allLibraries: [MediaLibrary] = []
-        var resumeAll: [MediaItem] = []
-        var nextAll: [MediaItem] = []
-        var favoriteAll: [MediaItem] = []
-        var shelves: [LibraryShelf] = []
-        var failure: String?
-        for account in accounts {
-            guard let client = app.client(for: account.id) else { continue }
-            async let resumeTask = try? client.resumeItems(limit: 12)
-            async let nextUpTask = try? client.nextUp(limit: 12)
-            async let favoritesTask = client.supportsFavorites ? (try? client.favorites()) : nil
-            do {
-                let libs = try await client.libraries().map { library in
-                    var copy = library
-                    copy.serverID = account.id
-                    if prefixNames { copy.serverName = account.name }
-                    return copy
-                }
-                allLibraries.append(contentsOf: libs)
-                shelves.append(contentsOf: await Self.loadShelves(client: client, libraries: Array(libs.prefix(8))))
-            } catch {
-                if failure == nil { failure = error.localizedDescription }
+        let tasks = accounts.compactMap { account -> Task<Void, Never>? in
+            guard let client = app.client(for: account.id) else { return nil }
+            return Task {
+                let content = await Self.loadServer(client: client, account: account, prefixNames: prefixNames)
+                guard current == loadID else { return }
+                contents[account.id] = content
+                apply(order: order)
             }
-            resumeAll.append(contentsOf: await resumeTask ?? [])
-            nextAll.append(contentsOf: await nextUpTask ?? [])
-            favoriteAll.append(contentsOf: await favoritesTask ?? [])
         }
-        libraries = allLibraries
-        latest = shelves
-        resume = resumeAll
-        nextUp = nextAll
-        favorites = favoriteAll
-        featured = Array(shelves.flatMap(\.items).filter { $0.posterURL != nil && $0.kind != .episode }.prefix(8))
+        for task in tasks { await task.value }
+        guard current == loadID else { return }
+        isLoading = false
+        errorText = libraries.isEmpty ? order.lazy.compactMap { contents[$0]?.failure }.first : nil
+    }
+
+    /// 按服务器列表的顺序合并已经回来的结果
+    private func apply(order: [UUID]) {
+        let parts = order.compactMap { contents[$0] }
+        libraries = parts.flatMap(\.libraries)
+        latest = parts.flatMap(\.shelves)
+        resume = parts.flatMap(\.resume)
+        nextUp = parts.flatMap(\.nextUp)
+        favorites = parts.flatMap(\.favorites)
+        let picks = Array(latest.flatMap(\.items).filter { $0.posterURL != nil && $0.kind != .episode }.prefix(8))
+        if picks.map(\.id) != featured.map(\.id) {
+            featured = picks
+            if !featured.isEmpty { prefetchFeatured() }
+        }
         if featuredSelection == nil || !featured.contains(where: { $0.id == featuredSelection }) {
             featuredSelection = featured.first?.id
         }
-        errorText = allLibraries.isEmpty ? failure : nil
-        partialError = allLibraries.isEmpty ? nil : failure.map { "有的服务器暂时连不上：\($0)" }
-        if !featured.isEmpty { prefetchFeatured() }
+        if !libraries.isEmpty { errorText = nil }
+    }
+
+    private static func loadServer(client: any MediaServerClient, account: ServerAccount, prefixNames: Bool) async -> ServerContent {
+        async let resumeTask = try? client.resumeItems(limit: 12)
+        async let nextUpTask = try? client.nextUp(limit: 12)
+        async let favoritesTask = client.supportsFavorites ? (try? client.favorites()) : nil
+        var content = ServerContent()
+        do {
+            let libs = try await client.libraries().map { library in
+                var copy = library
+                copy.serverID = account.id
+                if prefixNames { copy.serverName = account.name }
+                return copy
+            }
+            content.libraries = libs
+            content.shelves = await loadShelves(client: client, libraries: Array(libs.prefix(8)))
+        } catch {
+            content.failure = error.localizedDescription
+        }
+        content.resume = await resumeTask ?? []
+        content.nextUp = await nextUpTask ?? []
+        content.favorites = await favoritesTask ?? []
+        return content
     }
 
     /// 预先下载轮播海报和对应的模糊背景，翻页时直接显示
@@ -267,6 +290,10 @@ private struct FeaturedCarousel: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
     let items: [MediaItem]
     @Binding var selection: String?
+    @State private var cycle = FeaturedCycle(id: nil, start: .now)
+    @State private var isDragging = false
+
+    private static let interval: TimeInterval = 7
 
     var body: some View {
         VStack(spacing: 12) {
@@ -286,55 +313,64 @@ private struct FeaturedCarousel: View {
             .scrollIndicators(.hidden)
             .scrollTargetBehavior(.paging)
             .scrollPosition(id: $selection)
+            .onScrollPhaseChange { _, phase in
+                isDragging = phase == .tracking || phase == .interacting
+            }
             .aspectRatio(sizeClass == .regular ? 16 / 9 : 2 / 3.1, contentMode: .fit)
 
-            FeaturedPicker(items: items, selection: $selection)
+            FeaturedDots(items: items, selection: $selection, cycle: cycle, interval: Self.interval)
         }
-        .task {
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(7))
-                guard !items.isEmpty else { continue }
-                let index = items.firstIndex { $0.id == selection } ?? 0
-                withAnimation { selection = items[(index + 1) % items.count].id }
+        .task(id: FeaturedTrigger(selection: selection, isDragging: isDragging)) {
+            let current = selection
+            guard !isDragging else {
+                cycle = FeaturedCycle(id: nil, start: .now)
+                return
             }
+            cycle = FeaturedCycle(id: current, start: .now)
+            do {
+                try await Task.sleep(for: .seconds(Self.interval))
+            } catch {
+                return
+            }
+            guard !items.isEmpty, selection == current else { return }
+            let index = items.firstIndex { $0.id == current } ?? 0
+            withAnimation { selection = items[(index + 1) % items.count].id }
         }
     }
 }
 
-/// 用海报本身切换焦点内容，代替一排圆点
-private struct FeaturedPicker: View {
+/// 当前这一页从什么时候开始计时。读条和自动翻页共用这个起点。
+private struct FeaturedCycle: Equatable {
+    var id: String?
+    var start: Date
+}
+
+private struct FeaturedTrigger: Equatable {
+    var selection: String?
+    var isDragging: Bool
+}
+
+/// 圆点指示器：当前页拉长成胶囊，内部按真实时间走读条
+private struct FeaturedDots: View {
     let items: [MediaItem]
     @Binding var selection: String?
+    let cycle: FeaturedCycle
+    let interval: TimeInterval
+
+    private let dot: CGFloat = 6
+    private let active: CGFloat = 22
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            rail
-            ScrollView(.horizontal) {
-                rail.padding(.horizontal).hideSystemScrollbars()
-            }
-            .scrollIndicators(.hidden)
-        }
-        .frame(maxWidth: .infinity)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("精选")
-    }
-
-    private var rail: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 0) {
             ForEach(items) { item in
                 let selected = item.id == selection
                 Button {
                     withAnimation(.snappy(duration: 0.35)) { selection = item.id }
-                }                 label: {
-                    RemoteImage(url: item.posterURL ?? item.backdropURL)
-                        .frame(width: 36, height: 54)
-                        .clipShape(.rect(cornerRadius: 7))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 7)
-                                .strokeBorder(.white.opacity(selected ? 0.95 : 0), lineWidth: 1.5)
-                        }
-                        .scaleEffect(selected ? 1 : 0.84)
-                        .opacity(selected ? 1 : 0.5)
+                } label: {
+                    indicator(selected: selected, id: item.id)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 12)
+                        .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(item.name)
@@ -342,6 +378,33 @@ private struct FeaturedPicker: View {
             }
         }
         .animation(.snappy(duration: 0.3), value: selection)
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("精选")
+    }
+
+    @ViewBuilder
+    private func indicator(selected: Bool, id: String) -> some View {
+        let width = selected ? active : dot
+        Capsule()
+            .fill(.primary.opacity(selected ? 0.22 : 0.3))
+            .overlay(alignment: .leading) {
+                if selected {
+                    TimelineView(.animation) { context in
+                        Rectangle()
+                            .fill(.primary)
+                            .frame(width: active * progress(for: id, at: context.date))
+                    }
+                }
+            }
+            .clipShape(.capsule)
+            .frame(width: width, height: dot)
+    }
+
+    /// 不是当前计时的那一页时从 0 开始，避免切页的第一帧闪出满格
+    private func progress(for id: String, at date: Date) -> CGFloat {
+        guard cycle.id == id else { return 0 }
+        return CGFloat(min(max(date.timeIntervalSince(cycle.start) / interval, 0), 1))
     }
 }
 

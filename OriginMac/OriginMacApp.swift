@@ -46,6 +46,7 @@ struct OriginMacApp: App {
             NavigationStack {
                 SettingsView().mediaDestinations()
             }
+            .lanPairRequestAlert()
             .environment(app)
             .frame(width: 560, height: 700)
         }

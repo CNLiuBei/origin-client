@@ -126,6 +126,17 @@ protocol MediaServerClient: AnyObject, Sendable {
 extension MediaServerClient {
     func segments(for item: MediaItem) async -> [MediaSegment] { [] }
 
+    /// 按当前网络选一个能连上的地址，后面的请求和播放地址都走它。
+    func prepareConnection() async {
+        let route = await ServerRoute.shared.resolve(
+            account.connectionURL,
+            timeout: account.advanced.timeout,
+            allowsInsecureTLS: account.advanced.allowsInsecureTLS,
+            alternates: account.backupLines.map(\.url)
+        )
+        MediaRequestAuth.register(route, headers: streamHeaders)
+    }
+
     /// 剧集中当前单集之后的下一集
     func nextEpisode(after episode: MediaItem) async -> MediaItem? {
         guard episode.kind == .episode, let seriesID = episode.seriesID,

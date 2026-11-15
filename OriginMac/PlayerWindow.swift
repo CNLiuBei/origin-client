@@ -86,6 +86,7 @@ enum PlayerWindowChrome {
     static func setVisible(_ visible: Bool) {
         guard let playerWindow else { return }
         if visible {
+            NSApp.activate()
             playerWindow.makeKeyAndOrderFront(nil)
         } else if playerWindow.isVisible {
             playerWindow.orderOut(nil)
@@ -99,7 +100,7 @@ private struct PlayerStatusLabel: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Text(model.bytesPerSecond, format: .byteCount(style: .file, allowedUnits: [.kb, .mb, .gb], spellsOutZero: false)) + Text("/s")
+            Text("\(Text(model.bytesPerSecond, format: .byteCount(style: .file, allowedUnits: [.kb, .mb, .gb], spellsOutZero: false)))/s")
             TimelineView(.everyMinute) { context in
                 Text(context.date, format: .dateTime.hour().minute())
             }

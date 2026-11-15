@@ -5,6 +5,7 @@ import SwiftUI
 final class AppModel {
     let settings = AppSettings()
     let cloudSync = CloudSync()
+    let lanSync = LANSync()
     let downloads = DownloadManager()
     let browser = LocalServerBrowser()
     @ObservationIgnored lazy var player = PlayerPresenter(app: self)
@@ -21,8 +22,12 @@ final class AppModel {
         didSet {
             UserDefaults.standard.set(activeAccountID?.uuidString, forKey: "activeAccount")
             client = activeAccountID.flatMap(client(for:))
+            if !isRestoringActive, activeAccountID != oldValue { showActiveIfHidden() }
         }
     }
+
+    /// 启动和合并 iCloud 数据时设置当前服务器，不算用户主动切换，不改开关
+    @ObservationIgnored private var isRestoringActive = false
 
     /// 下次打开软件时首页使用的服务器
     var defaultHomeID: UUID? {
@@ -48,11 +53,20 @@ final class AppModel {
         let savedID = UserDefaults.standard.string(forKey: "activeAccount").flatMap(UUID.init(uuidString:))
         let homeID = UserDefaults.standard.string(forKey: "defaultHome").flatMap(UUID.init(uuidString:))
         defaultHomeID = accounts.first { $0.id == homeID }?.id
-        activeAccountID = accounts.first { $0.id == defaultHomeID }?.id
-            ?? accounts.first { $0.id == savedID }?.id
-            ?? accounts.first?.id
+        let preferred = accounts.first { $0.id == defaultHomeID }
+            ?? accounts.first { $0.id == savedID }
+            ?? accounts.first
+        isRestoringActive = true
+        if let preferred, preferred.aggregationDisabled, let shown = firstShownAccountID() {
+            activeAccountID = shown
+        } else {
+            activeAccountID = preferred?.id
+        }
+        isRestoringActive = false
         settings.cloudSync = cloudSync
         cloudSync.start(app: self)
+        lanSync.onPlayback = { [weak self] playback in self?.player.continuePlayback(playback) }
+        lanSync.start(app: self)
         // 启动时就开始找局域网服务器，打开添加页时列表已经在
         browser.start()
     }
@@ -86,12 +100,12 @@ final class AppModel {
         activeAccountID = account.id
     }
 
-    /// 参与首页聚合的服务器。当前服务器关掉聚合时，首页只显示它自己。
+    /// 首页、媒体库和搜索使用的服务器：打开“在首页和媒体库显示”且已解锁的那些。
+    /// 开关只管它自己那台，与是不是当前服务器无关；全部关掉时退回当前服务器，首页不会空着。
     var homeAccounts: [ServerAccount] {
         guard let active = activeAccount, !isLocked(active) else { return [] }
-        if active.aggregationDisabled { return [active] }
-        let peers = accounts.filter { !$0.aggregationDisabled && !isLocked($0) }
-        return peers.isEmpty ? [active] : peers
+        let shown = accounts.filter { !$0.aggregationDisabled && !isLocked($0) }
+        return shown.isEmpty ? [active] : shown
     }
 
     func applyResolvedLine(_ id: UUID, lineID: UUID?) {
@@ -104,20 +118,28 @@ final class AppModel {
     func collectLibraries() async -> (libraries: [MediaLibrary], failure: String?) {
         let servers = homeAccounts
         let prefix = servers.count > 1
+        // 各服务器同时请求，按列表顺序合并。连不上的那台只拖慢自己。
+        let tasks = servers.compactMap { account -> Task<Result<[MediaLibrary], Error>, Never>? in
+            guard let client = client(for: account.id) else { return nil }
+            return Task {
+                do {
+                    return .success(try await client.libraries().map { library in
+                        var copy = library
+                        copy.serverID = account.id
+                        if prefix { copy.serverName = account.name }
+                        return copy
+                    })
+                } catch {
+                    return .failure(error)
+                }
+            }
+        }
         var result: [MediaLibrary] = []
         var failure: String?
-        for account in servers {
-            guard let client = client(for: account.id) else { continue }
-            do {
-                let libraries = try await client.libraries()
-                result.append(contentsOf: libraries.map { library in
-                    var copy = library
-                    copy.serverID = account.id
-                    if prefix { copy.serverName = account.name }
-                    return copy
-                })
-            } catch {
-                if failure == nil { failure = error.localizedDescription }
+        for task in tasks {
+            switch await task.value {
+            case let .success(libraries): result.append(contentsOf: libraries)
+            case let .failure(error): if failure == nil { failure = error.localizedDescription }
             }
         }
         return (result, failure)
@@ -131,6 +153,7 @@ final class AppModel {
         for candidate in account.lineCandidates {
             MediaRequestAuth.register(candidate.url, headers: client.streamHeaders)
         }
+        Task { await client.prepareConnection() }
         return client
     }
 
@@ -157,8 +180,29 @@ final class AppModel {
         persist()
         cloudSync.upsert(account)
         let refreshed = client(for: account.id)
-        if activeAccountID == account.id { client = refreshed }
+        if activeAccountID == account.id {
+            client = refreshed
+            if account.aggregationDisabled, let other = firstShownAccountID(excluding: account.id) {
+                activeAccountID = other
+            }
+        }
         contentChanged()
+    }
+
+    /// 当前服务器要是显示中的那台：主动切到一台关掉显示的服务器，就把它的显示打开。
+    /// 加密服务器等解锁后再处理，取消解锁时开关保持原样。
+    private func showActiveIfHidden() {
+        guard let id = activeAccountID, let index = accounts.firstIndex(where: { $0.id == id }),
+              accounts[index].aggregationDisabled, !isLocked(accounts[index]) else { return }
+        accounts[index].aggregationDisabled = false
+        persist()
+        cloudSync.upsert(accounts[index])
+        contentChanged()
+    }
+
+    /// 开着“在首页和媒体库显示”且已解锁的第一台
+    private func firstShownAccountID(excluding id: UUID? = nil) -> UUID? {
+        accounts.first { $0.id != id && !$0.aggregationDisabled && !isLocked($0) }?.id
     }
 
     func moveAccounts(fromOffsets source: IndexSet, toOffset destination: Int) {
@@ -174,9 +218,9 @@ final class AppModel {
         persist()
         cloudSync.delete(account.id)
         unlockedServerIDs.remove(account.id)
-        if defaultHomeID == account.id { defaultHomeID = accounts.first?.id }
+        if defaultHomeID == account.id { defaultHomeID = firstShownAccountID() ?? accounts.first?.id }
         if activeAccountID == account.id {
-            activeAccountID = accounts.first?.id
+            activeAccountID = firstShownAccountID() ?? accounts.first?.id
         }
     }
 
@@ -190,6 +234,8 @@ final class AppModel {
     /// 另一台设备合并过来的服务器列表。只更新本机，不再上传。
     func replaceAccountsFromSync(_ incoming: [ServerAccount]) {
         guard incoming != accounts else { return }
+        isRestoringActive = true
+        defer { isRestoringActive = false }
         let previous = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0) })
         let incomingIDs = Set(incoming.map(\.id))
         for account in incoming where previous[account.id] != account {

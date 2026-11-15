@@ -271,7 +271,7 @@ final class FFmpegPlayerModel {
         artworkSessionID = sessionID
         guard let artworkURL = session.item.thumbURL ?? session.item.posterURL else { return }
         Task {
-            guard let (data, _) = try? await URLSession.shared.data(for: MediaRequestAuth.request(for: artworkURL)),
+            guard let (data, _) = try? await OriginTrust.session(for: artworkURL).data(for: MediaRequestAuth.request(for: artworkURL)),
                   let image = await ImageDecoding.decode(data, maxPixelSize: 1200),
                   sessionID == session.playSessionID else { return }
             var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
@@ -395,6 +395,13 @@ final class FFmpegPlayerModel {
     func setSubtitleDelay(_ value: Double) {
         subtitleDelay = value
         coordinator.subtitleModel.subtitleDelay = value
+    }
+
+    var handoffTargets: [LANPeer] { presenter?.handoffTargets ?? [] }
+
+    func handOff(to peer: LANPeer) {
+        guard presenter?.handOff(session, at: currentTime, to: peer) == true else { return }
+        close()
     }
 
     func togglePiP() {

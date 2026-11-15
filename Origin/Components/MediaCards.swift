@@ -66,7 +66,7 @@ enum ImageLoader {
 
     static func load(_ url: URL) async -> PlatformImage? {
         if let cached = cached(url) { return cached }
-        guard let (data, response) = try? await URLSession.shared.data(for: MediaRequestAuth.request(for: url)),
+        guard let (data, response) = try? await OriginTrust.session(for: url).data(for: MediaRequestAuth.request(for: url)),
               (response as? HTTPURLResponse)?.statusCode ?? 200 < 400,
               let decoded = await decode(data) else { return nil }
         cache.setObject(decoded, forKey: url as NSURL)

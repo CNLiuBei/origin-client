@@ -33,7 +33,7 @@ struct ServerAccount: Identifiable, Hashable, Codable, Sendable {
     var backupLines: [ServerLine] = []
     /// 当前线路；nil 表示主线路
     var activeLineID: UUID?
-    /// 为 true 时，这台服务器不并入首页和其他服务器的媒体库
+    /// 为 true 时，这台服务器不出现在首页、媒体库和搜索里
     var aggregationDisabled = false
     /// 自定义符号；nil 使用服务器类型的默认图标
     var customSymbol: String?
@@ -95,6 +95,8 @@ struct ServerAccount: Identifiable, Hashable, Codable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, kind, name, baseURL, userID, username, machineID
         case note, backupLines, activeLineID, aggregationDisabled, customSymbol, isEncrypted, advanced
+        /// 只读：早先单独的“在媒体库显示”开关，已并入 aggregationDisabled
+        case hiddenFromLibraries
     }
 
     init(from decoder: Decoder) throws {
@@ -110,6 +112,9 @@ struct ServerAccount: Identifiable, Hashable, Codable, Sendable {
         backupLines = try container.decodeIfPresent([ServerLine].self, forKey: .backupLines) ?? []
         activeLineID = try container.decodeIfPresent(UUID.self, forKey: .activeLineID)
         aggregationDisabled = try container.decodeIfPresent(Bool.self, forKey: .aggregationDisabled) ?? false
+        if try container.decodeIfPresent(Bool.self, forKey: .hiddenFromLibraries) == true {
+            aggregationDisabled = true
+        }
         customSymbol = try container.decodeIfPresent(String.self, forKey: .customSymbol)
         isEncrypted = try container.decodeIfPresent(Bool.self, forKey: .isEncrypted) ?? false
         advanced = try container.decodeIfPresent(ServerAdvanced.self, forKey: .advanced) ?? ServerAdvanced()
@@ -134,47 +139,143 @@ struct ServerAccount: Identifiable, Hashable, Codable, Sendable {
     }
 }
 
-enum ServerAddress {
-    /// 把主机、路径、端口和 https 拼成地址
-    static func compose(host: String, path: String, port: String, https: Bool) -> URL? {
-        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedHost.isEmpty, !trimmedHost.contains("/") else { return nil }
-        var components = URLComponents()
-        components.scheme = https ? "https" : "http"
-        components.host = trimmedHost
-        let portText = port.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !portText.isEmpty {
-            guard let value = Int(portText), (1 ... 65535).contains(value) else { return nil }
-            components.port = value
+/// 手动填写地址时的协议。自动会在连接时按端口和主机决定试 HTTP、HTTPS，或两种都试。
+enum ServerScheme: String, CaseIterable, Identifiable, Sendable {
+    case automatic
+    case http
+    case https
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic: "自动"
+        case .http: "HTTP"
+        case .https: "HTTPS"
         }
-        var pathText = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        while pathText.hasPrefix("/") { pathText.removeFirst() }
-        while pathText.hasSuffix("/") { pathText.removeLast() }
-        if !pathText.isEmpty { components.path = "/" + pathText }
-        return components.url
+    }
+}
+
+enum ServerAddress {
+    /// 拼出首选地址。自动时取 `probeURLs` 的第一个，不附带额外端口。
+    static func compose(host: String, path: String, port: String, scheme: ServerScheme) -> URL? {
+        probeURLs(host: host, path: path, port: port, scheme: scheme, alternatePorts: []).first
+    }
+
+    /// 连接时按顺序尝试的地址。指定 HTTP 或 HTTPS 时只生成该协议。
+    /// 自动且写了端口：443、8443、8920 只用 HTTPS，80 只用 HTTP，其余先 HTTP 再 HTTPS。
+    /// 自动且没写端口：域名先试 HTTPS，IP、localhost 和局域网主机名先试 HTTP 与默认端口。
+    static func probeURLs(host: String, path: String, port: String, scheme: ServerScheme, alternatePorts: [Int]) -> [URL] {
+        switch scheme {
+        case .http:
+            guard let primary = makeURL(host: host, path: path, port: port, https: false) else { return [] }
+            guard portNumber(port) == nil, normalizedPath(path).isEmpty else { return [primary] }
+            let extras = alternatePorts.compactMap { makeURL(host: host, path: path, port: String($0), https: false) }
+            return unique([primary] + extras)
+        case .https:
+            return makeURL(host: host, path: path, port: port, https: true).map { [$0] } ?? []
+        case .automatic:
+            return automaticURLs(host: host, path: path, port: port, alternatePorts: alternatePorts)
+        }
     }
 
     /// 把粘进「主机」的完整地址拆开。普通主机名原样保留。
-    static func absorb(host: inout String, path: inout String, port: inout String, https: inout Bool) {
+    /// 只有原文带 `http://` 或 `https://` 时才改协议，否则保持「自动」。
+    static func absorb(host: inout String, path: inout String, port: inout String, scheme: inout ServerScheme) {
         guard let parsed = parse(pasted: host) else { return }
-        let wasURL = host.contains("://") || host.contains("/")
+        let hadScheme = host.contains("://")
+        let hadSlash = host.contains("/")
         host = parsed.host
         if !parsed.path.isEmpty { path = parsed.path }
-        if wasURL {
+        if hadScheme {
             port = parsed.port
-            https = parsed.https
+            scheme = parsed.scheme
+        } else if hadSlash {
+            if !parsed.port.isEmpty { port = parsed.port }
         } else if !parsed.port.isEmpty {
             port = parsed.port
         }
     }
 
-    static func parts(of url: URL) -> (host: String, path: String, port: String, https: Bool) {
+    static func parts(of url: URL) -> (host: String, path: String, port: String, scheme: ServerScheme) {
         let stored = url.path()
         let path = (stored.isEmpty || stored == "/") ? "" : String(stored.drop(while: { $0 == "/" }))
-        return (url.host() ?? "", path, url.port.map(String.init) ?? "", url.scheme?.lowercased() == "https")
+        let scheme: ServerScheme = url.scheme?.lowercased() == "https" ? .https : .http
+        return (url.host() ?? "", path, url.port.map(String.init) ?? "", scheme)
     }
 
-    private static func parse(pasted raw: String) -> (host: String, path: String, port: String, https: Bool)? {
+    private static func automaticURLs(host: String, path: String, port: String, alternatePorts: [Int]) -> [URL] {
+        if let number = portNumber(port) {
+            let text = String(number)
+            switch number {
+            case 443, 8443, 8920:
+                return makeURL(host: host, path: path, port: text, https: true).map { [$0] } ?? []
+            case 80:
+                return makeURL(host: host, path: path, port: text, https: false).map { [$0] } ?? []
+            default:
+                return unique([false, true].compactMap { makeURL(host: host, path: path, port: text, https: $0) })
+            }
+        }
+        let secure = makeURL(host: host, path: path, port: "", https: true)
+        let plain = makeURL(host: host, path: path, port: "", https: false)
+        let defaults = normalizedPath(path).isEmpty
+            ? alternatePorts.compactMap { makeURL(host: host, path: path, port: String($0), https: false) }
+            : []
+        if prefersSecureFirst(host) {
+            return unique([secure].compactMap { $0 } + defaults + [plain].compactMap { $0 })
+        }
+        return unique(defaults + [plain, secure].compactMap { $0 })
+    }
+
+    private static func makeURL(host: String, path: String, port: String, https: Bool) -> URL? {
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty, !trimmedHost.contains("/") else { return nil }
+        var components = URLComponents()
+        components.scheme = https ? "https" : "http"
+        components.host = trimmedHost
+        if let port = portNumber(port) { components.port = port }
+        let pathText = normalizedPath(path)
+        if !pathText.isEmpty { components.path = "/" + pathText }
+        return components.url
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        var pathText = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        while pathText.hasPrefix("/") { pathText.removeFirst() }
+        while pathText.hasSuffix("/") { pathText.removeLast() }
+        return pathText
+    }
+
+    private static func portNumber(_ port: String) -> Int? {
+        let text = port.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, let value = Int(text), (1 ... 65535).contains(value) else { return nil }
+        return value
+    }
+
+    /// 域名先试 443。IP、无点主机名和 `.local` 多半在局域网，先试明文端口。
+    private static func prefersSecureFirst(_ host: String) -> Bool {
+        let name = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if name.isEmpty || name == "localhost" || name.hasSuffix(".local") || !name.contains(".") { return false }
+        return !isAddressLiteral(name)
+    }
+
+    private static func isAddressLiteral(_ host: String) -> Bool {
+        let bare = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if bare.contains(":") { return true }
+        let parts = bare.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { Int($0).map { (0 ... 255).contains($0) } ?? false }
+    }
+
+    private static func unique(_ urls: [URL]) -> [URL] {
+        var result: [URL] = []
+        for url in urls where !result.contains(url) {
+            result.append(url)
+        }
+        return result
+    }
+
+    private static func parse(pasted raw: String) -> (host: String, path: String, port: String, scheme: ServerScheme)? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         if trimmed.contains("://") || trimmed.contains("/") {
@@ -187,19 +288,19 @@ enum ServerAddress {
             let host = String(trimmed[trimmed.startIndex...end])
             let rest = trimmed[trimmed.index(after: end)...]
             guard rest.hasPrefix(":"), let port = Int(rest.dropFirst()), (1 ... 65535).contains(port) else { return nil }
-            return (host, "", String(port), false)
+            return (host, "", String(port), .http)
         }
         guard let colon = trimmed.lastIndex(of: ":") else { return nil }
         let host = String(trimmed[..<colon])
         let portText = String(trimmed[trimmed.index(after: colon)...])
         guard !host.isEmpty, !host.contains(":"), let port = Int(portText), (1 ... 65535).contains(port) else { return nil }
-        return (host, "", portText, false)
+        return (host, "", portText, .http)
     }
 
     static func same(_ url: URL, as other: URL) -> Bool {
         let left = parts(of: url)
         let right = parts(of: other)
-        return left.host == right.host && left.path == right.path && left.port == right.port && left.https == right.https
+        return left.host == right.host && left.path == right.path && left.port == right.port && left.scheme == right.scheme
     }
 }
 

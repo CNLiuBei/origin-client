@@ -12,7 +12,7 @@ struct RootView: View {
         @Bindable var player = app.player
         Group {
             if app.accounts.isEmpty {
-                WelcomeView()
+                NavigationStack { WelcomeView() }
             } else {
                 TabView(selection: $tab) {
                     Tab("首页", systemImage: "play.house", value: .home) {
@@ -43,6 +43,7 @@ struct RootView: View {
             }
         }
         .onAppear { HorizontalScrollbarSuppression.start() }
+        .lanPairRequestAlert()
         .overlay {
             if app.player.isPreparing {
                 VStack(spacing: 12) {

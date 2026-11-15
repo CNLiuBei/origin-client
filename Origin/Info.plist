@@ -34,18 +34,18 @@
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
 	</dict>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_trim_media._tcp</string>
 		<string>_plexmediasvr._tcp</string>
+		<string>_originsync._tcp</string>
+		<string>_originpair._tcp</string>
 	</array>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Origin 会在你打开已加密的服务器前，用面容 ID 确认是你本人。</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Origin 需要访问本地网络，以发现并连接局域网中的飞牛影视、Emby、Jellyfin 或 Plex 媒体服务器。</string>
+	<string>Origin 需要访问本地网络，以发现并连接局域网中的飞牛影视、Emby、Jellyfin 或 Plex 媒体服务器，并和同一网络里的其他设备同步服务器与设置。</string>
 	<key>TMDBReadToken</key>
 	<string>$(TMDB_READ_TOKEN)</string>
 	<key>UIApplicationSceneManifest</key>

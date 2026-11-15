@@ -47,16 +47,30 @@ enum Keychain {
     }
 
     static func data(for key: String) -> Data? {
-        readData(itemQuery(key, synchronizable: false))
+        let (value, status) = readData(itemQuery(key, synchronizable: false))
+        #if os(macOS)
+        if value == nil, status == errSecMissingEntitlement, useDataProtection {
+            useDataProtection = false
+            return readData(itemQuery(key, synchronizable: false)).0
+        }
+        #endif
+        return value
     }
 
     static func synchronizableData(for key: String) -> Data? {
-        readData(itemQuery(key, synchronizable: true))
+        readData(itemQuery(key, synchronizable: true)).0
     }
 
     @discardableResult
     static func setData(_ value: Data?, for key: String, synchronizable: Bool) -> Bool {
-        let localOK = writeData(value, for: key, synchronizable: false) == errSecSuccess
+        var status = writeData(value, for: key, synchronizable: false)
+        #if os(macOS)
+        if status == errSecMissingEntitlement, useDataProtection {
+            useDataProtection = false
+            status = writeData(value, for: key, synchronizable: false)
+        }
+        #endif
+        let localOK = status == errSecSuccess
         if synchronizable {
             _ = writeData(value, for: key, synchronizable: true)
         }
@@ -104,14 +118,14 @@ enum Keychain {
         return query
     }
 
-    private static func readData(_ base: [String: Any]) -> Data? {
+    private static func readData(_ base: [String: Any]) -> (Data?, OSStatus) {
         var query = base
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess else { return nil }
-        return result as? Data
+        guard status == errSecSuccess else { return (nil, status) }
+        return (result as? Data, status)
     }
 
     private static func write(_ value: String?, for key: String, synchronizable: Bool) -> OSStatus {
