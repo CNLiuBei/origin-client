@@ -27,6 +27,15 @@
 
 打开 iCloud 同步后，同一 Apple 账号下的设备也会同步服务器、登录令牌和播放设置。各设备仍各自选择当前服务器。没有 iCloud 键值存储权限时，同步改走 iCloud 钥匙串。系统设置里需要打开 iCloud 钥匙串，服务器和播放设置才会到其他设备。
 
+## 下载
+
+每次推送到 main，GitHub Actions 会编译一次，结果放在 Releases 的「最新构建」里。推送 `v` 开头的标签时发正式版。
+
+- iPhone / iPad：`Origin-iOS.ipa` 没有签名，用爱思助手、Sideloadly 或 AltStore 签名安装。
+- Mac：`Origin-macOS.zip` 是通用版，Intel 和 Apple 芯片都能用。解压后拖进「应用程序」。第一次打开如果被拦，到「系统设置 → 隐私与安全性」点「仍要打开」。
+
+本机可以用 `scripts/ci-build.sh` 打出同样的包，放在 `build/dist`。
+
 ## 环境
 
 - Xcode，以及 iOS 26、macOS 26 SDK
@@ -40,7 +49,7 @@ scripts/bootstrap.sh
 open Origin.xcodeproj
 ```
 
-工程文件由 `project.yml` 生成，不放进仓库。依赖在 `Vendor/`，同样不放进仓库。
+工程文件由 `project.yml` 生成，不放进仓库。依赖在 `Vendor/`，同样不放进仓库。对 KSPlayer 的修改放在 `patches/KSPlayer.patch`，`bootstrap.sh` 会自动打上。
 
 TMDB 的 Read Access Token 写在 `Config/Secrets.xcconfig`。这个文件被 git 忽略。没有它也能编译和播放，只是不会去拉 TMDB 的补充信息。示例在 `Config/Secrets.example.xcconfig`。
 
